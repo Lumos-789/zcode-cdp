@@ -1,0 +1,280 @@
+#!/bin/bash
+# cdp-takeover — Agent 专用 Chrome 多实例端口池管理器
+#
+# 两类 Agent Chrome（各占独立端口 + profile，两层隔离：端口 / profile）：
+#   - 会话临时池：9223-9229（ZCode/Codex/cdpcc 临时浏览器，最多 7 个并发）
+#   - 脚本固定端口：93xx（durable 浏览器，供 Python/playwright 直连客户端长期常驻，不进 pick 池）
+#
+# cdpcc 自动从 9223-9229 找第一个空闲端口；自动化脚本显式指定 93xx 端口。
+# 工具前缀统一 mcp__cdp__*（按需改造后不再按端口区分 cdp/cdp2/cdp3）。
+# profile 首次从用户 profile rsync 继承登录态，之后独立演化；--refresh 手动刷新。
+# profile 头像（每端口不同卡通 avatar），区分各实例。
+#
+# 两种启动模式：
+#   - durable（默认）：人工直接调用，Chrome 跨客户端连接长期存在，不创建会话 lease。
+#     用于直接 CDP 客户端（Python 裸 WebSocket / playwright connect_over_cdp）。
+#   - managed（--managed --lease-id <id>）：由 zcode-cdp-proxy/cdpcc 调用，
+#     核验调用者拥有端口 lease 后启动 Chrome。proxy/cdpcc 退出时通过 lease 释放。
+#
+# 用法：
+#   cdp-takeover                    自动找第一个空闲端口（durable）
+#   cdp-takeover <port>             显式端口（9223-9229 / 93xx）（durable）
+#   cdp-takeover <port> --refresh   强制从源 rsync 该端口 profile（实例须已关）
+#   cdp-takeover --refresh <port>   同上
+#   cdp-takeover <port> --managed --lease-id <id>   managed 模式（proxy/cdpcc 内部用）
+#   cdp-takeover status             打印端口占用表
+
+set -euo pipefail
+
+# 会话临时池（ZCode/Codex/cdpcc 从中 pick 空闲）
+PORTS=(9223 9224 9225 9226 9227 9228 9229)
+# status 展示用（含脚本固定端口示例，用户可按需修改）
+SCRIPT_PORTS=(9324 9326)
+ALL_PORTS=(9223 9224 9225 9226 9227 9228 9229 9324 9326)
+# 93xx 端口用途示例（用户按需自定）：9324 / 9326 可作为 durable 客户端固定端口
+PROFILE_SRC="$HOME/Library/Application Support/Google/Chrome"
+LOCKDIR="/tmp/cdp-takeover.$USER.lock"
+
+# 端口 → 配置：owner|avatar_idx|window_pos
+# owner：session(会话临时池) / scripts(脚本固定端口)；avatar_idx：Chrome 内置头像编号
+port_meta() {
+  case "$1" in
+    9223) echo "session|8|-1655,-1340" ;;
+    9224) echo "session|16|-1655,-1190" ;;
+    9225) echo "session|24|-1655,-1040" ;;
+    9226) echo "session|32|-1655,-890" ;;
+    9227) echo "session|40|-1655,-740" ;;
+    9228) echo "session|48|-1655,-590" ;;
+    9229) echo "session|52|-1655,-440" ;;
+    9324) echo "scripts|58|-1350,-1190" ;;
+    9326) echo "scripts|60|-1350,-890" ;;
+    *) return 1 ;;
+  esac
+}
+
+port_pid() { lsof -iTCP:"$1" -sTCP:LISTEN -P -n -t 2>/dev/null | head -1 || true; }
+is_agent_pid() { [ -n "${1:-}" ] && ps -p "$1" -o args= 2>/dev/null | grep -q "chrome-takeover"; }
+
+# cdpcc 窗口锁主是否存活(status 只读判定,与 cdpcc 脚本同款:PID 存活 + command 含 cdpcc)
+cdpcc_lock_alive() {
+  local pid cmd
+  pid=$(cat "/tmp/cdpcc-port-$1.lock/pid" 2>/dev/null) || return 1
+  [ -n "$pid" ] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  cmd=$(ps -p "$pid" -o command= 2>/dev/null) || return 1
+  case "$cmd" in *cdpcc*) return 0 ;; *) return 1 ;; esac
+}
+
+# 全局锁:带 owner PID 的原子锁,防 SIGKILL 遗留空目录永久阻塞
+# 锁格式: $LOCKDIR/owner (内容: PID|startTime)
+acquire_lock() {
+  local owner_pid owner_start lock_owner lock_pid lock_start
+  owner_pid=$$
+  owner_start=$(ps -p "$owner_pid" -o lstart= 2>/dev/null | tr ' ' '_')
+
+  for attempt in 1 2 3 4 5; do
+    if mkdir "$LOCKDIR" 2>/dev/null; then
+      echo "${owner_pid}|${owner_start}" > "$LOCKDIR/owner"
+      trap 'rmdir "$LOCKDIR" 2>/dev/null || true' EXIT INT TERM
+      return 0
+    fi
+    # 锁已存在:校验 owner 是否存活
+    lock_owner=$(cat "$LOCKDIR/owner" 2>/dev/null || echo "")
+    lock_pid="${lock_owner%%|*}"
+    lock_start="${lock_owner##*|}"
+    if [ -z "$lock_pid" ] || [ "$lock_pid" = "$lock_owner" ]; then
+      # 无 owner 文件(旧格式或 mkdir 后崩溃) → 检查锁龄
+      local lock_age
+      lock_age=$(( $(date +%s) - $(stat -f %m "$LOCKDIR" 2>/dev/null || echo 0) ))
+      if [ "$lock_age" -gt 30 ]; then
+        echo "⚠️ 全局锁无 owner 且超 30s,回收(stale)" >&2
+        rm -rf "$LOCKDIR" 2>/dev/null || true
+        continue
+      fi
+    elif ! kill -0 "$lock_pid" 2>/dev/null; then
+      # owner 已死 → 回收 stale 锁
+      echo "⚠️ 全局锁 owner(PID $lock_pid)已死,回收(stale)" >&2
+      rm -rf "$LOCKDIR" 2>/dev/null || true
+      continue
+    fi
+    # owner 存活 → 等待
+    sleep 1
+  done
+  echo "⏳ 另一个 cdp-takeover 正在分配端口，5s 后仍忙" >&2
+  exit 1
+}
+
+# managed 模式 lease 校验:确认调用者确实拥有该端口 lease
+# 通过 node 调用 zcode-cdp-lease.js 的 check 命令
+verify_lease() {
+  local port="$1" lease_id="$2"
+  local lease_root="${CDP_LOCK_ROOT:-/tmp/zcode-cdp/ports}"
+  local result
+  result=$(CDP_LOCK_ROOT="$lease_root" node "$(dirname "$0")/zcode-cdp-lease.js" check "$port" 2>/dev/null || echo '{"error":"check failed"}')
+  # lease check 只用于日志,managed 模式不阻塞(proxy 已持有 lease)
+  echo "$result" >&2
+}
+
+pick_free_port() {
+  local p pid
+  for p in "${PORTS[@]}"; do
+    pid=$(port_pid "$p")
+    if [ -z "${pid}" ]; then echo "$p"; return 0; fi
+  done
+  return 1
+}
+
+do_status() {
+  printf "%-7s %-6s %-8s %-7s %s\n" "端口" "状态" "PID" "用途" "说明"
+  local lease_root="${CDP_LOCK_ROOT:-/tmp/zcode-cdp/ports}"
+  for p in "${ALL_PORTS[@]}"; do
+    local pid owner note lease_pid lease_state; pid=$(port_pid "$p"); owner=$(port_meta "$p"); owner="${owner%%|*}"
+    if [ "${owner}" = "session" ]; then note="会话临时池"; elif [ "${owner}" = "scripts" ]; then note="脚本固定端口"; else note="-"; fi
+    # 新 lease(zcode-cdp-lease)状态
+    if [ -f "$lease_root/$p.lock/owner.json" ]; then
+      lease_pid=$(python3 -c "import json;print(json.load(open('$lease_root/$p.lock/owner.json')).get('ownerPid',''))" 2>/dev/null || echo "")
+      lease_state=$(python3 -c "import json;print(json.load(open('$lease_root/$p.lock/owner.json')).get('state',''))" 2>/dev/null || echo "")
+    fi
+    if [ -n "${pid}" ]; then
+      if is_agent_pid "${pid}"; then
+        printf "%-7s %-6s %-8s %-7s %s\n" "$p" "运行" "${pid}" "${owner}" "${note}"
+      else
+        printf "%-7s %-6s %-8s %-7s %s\n" "$p" "被占" "${pid}" "${owner}" "非agent"
+      fi
+    elif [ -n "${lease_pid:-}" ]; then
+      printf "%-7s %-6s %-8s %-7s %s\n" "$p" "占位" "${lease_pid}" "${owner}" "${note},lease=${lease_state:-?}"
+    elif [ "${owner}" = "session" ] && cdpcc_lock_alive "$p"; then
+      printf "%-7s %-6s %-8s %-7s %s\n" "$p" "占位" "-" "${owner}" "${note},浏览器未起(旧锁)"
+    else
+      printf "%-7s %-6s %-8s %-7s %s\n" "$p" "空闲" "-" "${owner}" "${note}"
+    fi
+  done
+}
+
+# ---- 解析子命令 ----
+REFRESH=0
+TARGET_PORT=""
+MANAGED=0
+LEASE_ID=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    status) do_status; exit 0 ;;
+    --refresh) REFRESH=1 ;;
+    --managed) MANAGED=1 ;;
+    --lease-id) shift; LEASE_ID="${1:-}" ;;
+    ''|*[0-9]*) TARGET_PORT="$1" ;;
+    *) echo "❌ 未知参数：$1（用法见脚本头注释）" >&2; exit 1 ;;
+  esac
+  shift
+done
+
+acquire_lock
+
+# managed 模式:核验调用者拥有端口 lease（proxy/cdpcc 内部调用专用）
+if [ "$MANAGED" = "1" ] && [ -n "$TARGET_PORT" ] && [ -n "$LEASE_ID" ]; then
+  verify_lease "$TARGET_PORT" "$LEASE_ID"
+fi
+
+# 确定目标端口
+if [ -z "${TARGET_PORT}" ]; then
+  if ! TARGET_PORT=$(pick_free_port); then
+    echo "❌ 七个临时端口（9223-9229）都在用，开不了第 8 个实例。" >&2
+    echo "" >&2; do_status >&2; echo "" >&2
+    echo "提示：先 Cmd+Q 关掉一个 cdpcc 窗口释放端口再重试。" >&2
+    exit 1
+  fi
+fi
+
+meta=$(port_meta "${TARGET_PORT}") || { echo "❌ 端口 ${TARGET_PORT} 不在支持范围（临时 9223-9229 / 脚本 93xx）" >&2; exit 1; }
+IFS='|' read -r OWNER AVATAR_IDX WIN_POS <<< "$meta"
+PROFILE_DST="$HOME/.chrome-takeover-${TARGET_PORT}"
+
+# 防重入（实例在跑 → 复用；非 agent 占用 → 报错）
+pid=$(port_pid "${TARGET_PORT}")
+if [ -n "${pid}" ]; then
+  if is_agent_pid "${pid}"; then
+    echo "✅ Agent Chrome 已在跑 — 端口 ${TARGET_PORT}（PID ${pid}，${OWNER}）"
+    exit 0
+  else
+    echo "❌ 端口 ${TARGET_PORT} 被非 agent 进程占用（PID ${pid}）" >&2; exit 1
+  fi
+fi
+
+# 一次性迁移旧 profile 到 9223 槽位（保留已有登录态）
+if [ "${TARGET_PORT}" = "9223" ] && [ ! -d "$PROFILE_DST/Default" ] && [ -d "$HOME/.chrome-takeover/Default" ]; then
+  echo "📦 迁移旧 profile ~/.chrome-takeover → $PROFILE_DST"
+  mv "$HOME/.chrome-takeover" "$PROFILE_DST"
+fi
+
+# profile 同步（决策5：首次 rsync，之后独立演化；--refresh 强制覆盖）
+rsync_profile() {
+  mkdir -p "$PROFILE_DST"
+  rsync -a --delete "$PROFILE_SRC/" "$PROFILE_DST/" \
+    --exclude='SingletonLock' --exclude='SingletonSocket' --exclude='SingletonCookie' --exclude='lockfile'
+}
+if [ "$REFRESH" = "1" ]; then
+  echo "🔄 强制从源刷新 profile：$PROFILE_DST"
+  rsync_profile
+elif [ -d "$PROFILE_DST/Default" ]; then
+  echo "ℹ️  profile 已存在，独立演化（不覆盖；要刷新登录态用 cdp-takeover ${TARGET_PORT} --refresh）"
+else
+  echo "首次初始化：rsync 用户 profile 继承登录态 → $PROFILE_DST"
+  rsync_profile
+fi
+
+# 打标记：profile 头像（python 段）
+echo "设置 agent 头像（端口 ${TARGET_PORT}）..."
+PORT="${TARGET_PORT}" PROFILE_DST="$PROFILE_DST" AVATAR_IDX="$AVATAR_IDX" \
+python3 << 'PYEOF'
+import json, os, sys
+
+PROFILE_DST = os.environ["PROFILE_DST"]
+avatar_idx = int(os.environ["AVATAR_IDX"])
+
+# Preferences：profile avatar
+prefs_path = os.path.join(PROFILE_DST, "Default", "Preferences")
+if not os.path.exists(prefs_path):
+    print("Preferences 不存在，跳过"); sys.exit(0)
+with open(prefs_path) as f:
+    prefs = json.load(f)
+prefs.setdefault("profile", {})
+prefs["profile"]["avatar_index"] = avatar_idx
+with open(prefs_path, "w") as f:
+    json.dump(prefs, f)
+
+# Local State：avatar
+local_state_path = os.path.join(PROFILE_DST, "Local State")
+if os.path.exists(local_state_path):
+    with open(local_state_path) as f:
+        ls = json.load(f)
+    info = ls.setdefault("profile", {}).setdefault("info_cache", {}).setdefault("Default", {})
+    info["is_using_default_avatar"] = False
+    info["avatar_icon"] = f"chrome://theme/IDR_PROFILE_AVATAR_{avatar_idx}"
+    with open(local_state_path, "w") as f:
+        json.dump(ls, f)
+    print(f"✅ Local State: avatar={avatar_idx}")
+PYEOF
+
+# 启动 Agent Chrome（外接左屏，多窗口 Y 错开层叠）
+echo "启动 Agent Chrome（外接左屏），端口 ${TARGET_PORT}..."
+nohup /Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome \
+  --remote-debugging-port="${TARGET_PORT}" \
+  --remote-allow-origins=* \
+  --user-data-dir="$PROFILE_DST" \
+  --window-position="$WIN_POS" \
+  --no-first-run \
+  --no-default-browser-check \
+  > /dev/null 2>&1 &
+
+# 等端口就绪
+echo "等待 DevTools 就绪（端口 ${TARGET_PORT}）..."
+for i in $(seq 1 15); do
+  if lsof -iTCP:"${TARGET_PORT}" -sTCP:LISTEN -P -n >/dev/null 2>&1; then
+    echo "✅ Agent Chrome 就绪 — 端口 ${TARGET_PORT}（${OWNER}）"
+    exit 0
+  fi
+  sleep 1
+done
+echo "❌ 端口 ${TARGET_PORT} 15s 后仍未监听，启动失败" >&2
+exit 1

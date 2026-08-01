@@ -1,0 +1,40 @@
+{
+  "name": "zcode-cdp",
+  "version": "0.1.0",
+  "description": "Take over a real, already-logged-in Chrome for your AI coding agent via Chrome DevTools Protocol — with production-grade port lease, watchdog, and state-machine governance.",
+  "license": "MIT",
+  "author": "Lumos-789",
+  "homepage": "https://github.com/Lumos-789/zcode-cdp",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Lumos-789/zcode-cdp.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Lumos-789/zcode-cdp/issues"
+  },
+  "keywords": [
+    "cdp",
+    "chrome-devtools-protocol",
+    "ai-agent",
+    "browser-automation",
+    "mcp",
+    "model-context-protocol",
+    "playwright",
+    "claude-code",
+    "zcode",
+    "takeover",
+    "browser-lease"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@playwright/mcp": "^0.0.30"
+  },
+  "bin": {
+    "zcode-cdp-proxy": "bin/zcode-cdp-proxy.js",
+    "zcode-cdp-lease": "bin/zcode-cdp-lease.js",
+    "cdp-takeover": "bin/cdp-takeover",
+    "cdpcc": "bin/cdpcc"
+  }
+}

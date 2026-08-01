@@ -1,0 +1,103 @@
+#!/bin/bash
+# cdpcc — 启动「带浏览器」的 Claude Code(懒加载版)
+#
+# 解决:全局 cdp MCP 让每个 CC 都挂全套浏览器进程的浪费。本 wrapper 只在启动时
+# 注入 cdp MCP 配置(指向某端口)+ 预占端口,**不起 Chrome**;等 agent 首次调用
+# mcp__cdp__* 工具时,由 PreToolUse hook(~/.zcode/hooks/cdp-ensure.sh)触发
+# cdp-takeover 把 Agent Chrome 起到该端口。不用浏览器 = 0 Chrome 进程。
+#
+# 端口预占:通过统一 lease manager(zcode-cdp-lease.js)领取端口租约,
+# 与 zcode-cdp-proxy 共享同一原子锁命名空间,消除双 owner 竞态。
+#
+# 多个 cdpcc 窗口自动分到不同端口(9223/9224/9225/9227/9228/9229),互不冲突;工具统一 mcp__cdp__*。
+#
+# 用法:
+#   cdpcc                       自动选空闲端口,启带 cdp 工具的 CC(Chrome 懒起)
+#   cdpcc <任意 claude 参数>    透传给 claude(如 --resume、目录等)
+
+set -euo pipefail
+
+# 脚本自身所在目录（bin/ 下其余脚本都在这）
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# 解析 @playwright/mcp 的 cli.js（优先 env，其次 node 自动发现，最后兜底常见路径）
+resolve_cli() {
+  if [ -n "${CDP_PLAYWRIGHT_MCP_CLI:-}" ]; then echo "$CDP_PLAYWRIGHT_MCP_CLI"; return; fi
+  local resolved
+  resolved=$(node -e "try{console.log(require.resolve('@playwright/mcp/cli.js'))}catch{}" 2>/dev/null) || true
+  if [ -n "$resolved" ]; then echo "$resolved"; return; fi
+  for p in "$HOME/.npm-global/lib/node_modules/@playwright/mcp/cli.js" \
+           "/usr/local/lib/node_modules/@playwright/mcp/cli.js" \
+           "/usr/lib/node_modules/@playwright/mcp/cli.js"; do
+    if [ -f "$p" ]; then echo "$p"; return; fi
+  done
+  echo "❌ 未找到 @playwright/mcp。请 'npm install -g @playwright/mcp'，或设置 CDP_PLAYWRIGHT_MCP_CLI" >&2
+  exit 1
+}
+CLI="$(resolve_cli)"
+TAKEOVER="$SCRIPT_DIR/cdp-takeover"
+LEASE="$SCRIPT_DIR/zcode-cdp-lease.js"
+
+port_pid() { lsof -iTCP:"$1" -sTCP:LISTEN -P -n -t 2>/dev/null | head -1 || true; }
+
+# 端口上的进程是否是 Agent Chrome(命令行含 chrome-takeover;复用 cdp-takeover 同款判定)
+is_agent_pid() { [ -n "${1:-}" ] && ps -p "$1" -o args= 2>/dev/null | grep -q "chrome-takeover"; }
+
+# 子命令:cdpcc --reap — 通过统一 lease manager 清扫孤儿
+if [ "${1:-}" = "--reap" ]; then
+  node "$LEASE" reap
+  exit 0
+fi
+
+# 0. 启动期兜底:通过统一 lease manager 清扫孤儿(遗留锁 + 孤儿 Chrome)
+node "$LEASE" reap >&2
+
+# 1. 通过统一 lease manager 领取端口租约(kind="cdpcc")
+RESERVE_OUT=$(node "$LEASE" reserve cdpcc 2>&1) || {
+  echo "❌ 六个端口(9223/9224/9225/9227/9228/9229)都被占着,开不了第 7 个。" >&2
+  echo "" >&2; "$TAKEOVER" status >&2; echo "" >&2
+  echo "提示:关掉一个 cdpcc 窗口即可(退出时自动释放端口和 Chrome)。" >&2
+  exit 1
+}
+
+# 解析 JSON: {port, leaseId}
+PORT=$(echo "$RESERVE_OUT" | python3 -c "import sys,json;print(json.load(sys.stdin)['port'])")
+LEASE_ID=$(echo "$RESERVE_OUT" | python3 -c "import sys,json;print(json.load(sys.stdin)['leaseId'])")
+
+echo "🎯 分配端口 $PORT(Chrome 懒起:首次用浏览器时由 hook 拉起)"
+
+# 2. 生成只含 1 个 cdp 的临时 MCP 配置(指向本端口;playwright/mcp 启动不连,首次工具调用才连)
+TMP="/tmp/cdpcc-${PORT}-$$.json"
+cat > "$TMP" <<EOF
+{"mcpServers":{"cdp":{"type":"stdio","command":"node","args":["$CLI","--cdp-endpoint","http://127.0.0.1:$PORT"]}}}
+EOF
+
+# 3. 暴露端口给 PreToolUse hook 子进程(继承 CC 环境)
+export CDPCC_PORT="$PORT"
+
+# 4. cleanup:关该端口 Chrome(若曾起过)+ 删临时配置 + 释放 lease(幂等)
+cleanup() {
+  local pid
+  pid=$(port_pid "$PORT")
+  if [ -n "${pid:-}" ]; then
+    kill "$pid" 2>/dev/null || true
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+      port_pid "$PORT" >/dev/null 2>&1 || break
+      sleep 0.3
+    done
+    pid=$(port_pid "$PORT")
+    if [ -n "${pid:-}" ]; then kill -9 "$pid" 2>/dev/null || true; fi
+  fi
+  rm -f "$TMP"
+  # 通过统一 lease manager 释放(核对 leaseId,防误删)
+  node "$LEASE" release "$PORT" "$LEASE_ID" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT INT TERM
+
+echo ""
+echo "🚀 启动 Claude Code(本会话 cdp → 端口 $PORT)"
+echo "   mcp__cdp__* 可直接用;首次调用浏览器工具时自动起 Chrome,退出时自动关。"
+echo ""
+
+# 5. 前台启 claude(不用 exec,保留 trap);claude 退出后 cleanup 触发
+claude --mcp-config "$TMP" "$@"

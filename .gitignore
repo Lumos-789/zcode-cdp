@@ -1,0 +1,36 @@
+# Dependencies
+node_modules/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs & runtime
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Local profile data (never commit — may contain login state)
+.chrome-takeover-*
+chrome-takeover-*/
+
+# Local env / config overrides
+.env
+.env.local
+*.local.json
+
+# Backup files
+*.bak
+*.bak.*
+
+# Test artifacts
+coverage/
+.nyc_output/

@@ -1,0 +1,11 @@
+{
+  "_comment": "Sample MCP server registration for ZCode / Claude Code config.json. Copy this object into the `mcp.servers` map of your client config. Adjust the path to point at your checkout of this repo.",
+  "_comment_2": "ZCode config path: ~/.zcode/cli/config.json   |   Claude Code: ~/.claude.json (or project .mcp.json)",
+  "mcpServers": {
+    "cdp": {
+      "type": "stdio",
+      "command": "node",
+      "args": ["/absolute/path/to/zcode-cdp/bin/zcode-cdp-proxy.js"]
+    }
+  }
+}
