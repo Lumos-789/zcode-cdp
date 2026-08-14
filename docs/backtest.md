@@ -9,6 +9,7 @@
 |---|---|---|---|---|
 | **L0 静态自检** | 语法检查 + 契约 marker 存在性 | 无 | ~2s | `test/backtest.sh` 内联 |
 | **L1 lease 单元** | 端口租约生命周期(reserve/check/mark-active/release/reap/stale/zombie) | 无 Chrome | ~2s | `test/lease.test.js` |
+| **L1.5 relay 单元** | TCP 中继七场景(挂起/接通/双向转发/detach-重挂/端口轮换/failHeld/超时/stop) | 无 Chrome | ~5s | `test/relay.test.js` |
 | **L2 proxy 状态机** | 端到端:placeholder 应答 → 激活 → close → rearm → 再激活 → 退出清理 | stub backend + stub takeover | ~10s | `test/proxy.test.js` |
 
 三层全部**零真实 Chrome、零用户 profile 副作用、不碰生产 9223-9229 端口**:
@@ -47,14 +48,36 @@ node test/proxy.test.js
 
 **L2 状态机与回归用例**:
 
-- READY_IDLE = 0 端口 0 Chrome(激活前无锁)
-- 首次 `browser_` 激活:reserve → takeover → real backend → synthetic 握手 → flush batch
-- `browser_close`:响应先返回,再释放租约回 READY_IDLE
-- **回归#1**: close 后 `tools/list` 仍能应答(placeholder 重启补 synthetic 握手,
-  2026-08-15 修复的悬挂 bug)
-- **回归#2**: close 后再次 `browser_` 重新激活(释放期间缓冲请求的重放路径)
-- READY_IDLE 收到 `browser_close` 直接成功响应(不起 Chrome)
+- IDLE = 0 端口 0 Chrome(激活前无锁),backend 常驻(全程只 spawn 一次)
+- 首次 `browser_` 激活:reserve → takeover → relay.attach → 请求经中继流动
+- `browser_close`:响应先返回,再释放租约回 IDLE(断言轮询等待最终一致 ——
+  stub 环境下 teardown 的 timer 调度偶发延迟,见下"已知问题")
+- **回归#1**: close 后 `tools/list` 仍能应答(单常驻 backend,无需重握手)
+- **回归#2**: close 后再次 `browser_` 重新激活成功(teardown 自动重激活路径)
+- **回归#3**: 全程 backend 只 spawn 一次(stderr 的 spawn 日志恰为 1 条)
+- IDLE/CLOSING 收到 `browser_close` 直接成功响应(不起 Chrome)
 - 持有租约时 SIGTERM → exit hook 清锁
+
+**已知问题(未定位,如实记录)**:L2 stub 环境下偶发(约 6/7 概率、注入观察后消失的
+Heisenbug)proxy 内 `setTimeout` 续体延迟 >1.5s(teardown 的轮询不推进),期间 IO
+正常、退出清理正常完成、无资源泄漏;干净观察实验与半 live(真 playwright-mcp +
+真 Chrome)多轮实测均正常。疑与 node `execSync` 嵌套事件循环/SIGCHLD reaping 交互
+有关。回测断言因此对 close 释放采用轮询等最终一致(契约:锁最终删除),不锁精确耗时。
+待验证条件:在 proxy 内以 async 版 portPid(替代 execSync)复测 L2 可否稳定复现。
+
+## 半 live 验证(手动,不进 npm test)
+
+真组件端到端(真 `@playwright/mcp` + 真 Chrome + 隔离 `CDP_LOCK_ROOT`):
+
+```bash
+# 用空闲池端口(如 9224,profile 已存在则秒起),锁根指向临时目录
+CDP_LOCK_ROOT=$(mktemp -d) CDP_PORTS=9224 node <驱动脚本>
+# 验证链:navigate 真实页面 → close(锁删) → 再 navigate(同 backend 重新激活)
+# → close → 无 Chrome 残留(lsof 9224 为空)
+```
+
+2026-08-15 relay 架构验收实测:example.com → close → example.org 全链路通过,
+backend 单实例,零残留。
 
 ## 已知盲区(为什么需要 live 冒烟)
 

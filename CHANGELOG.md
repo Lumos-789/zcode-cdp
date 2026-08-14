@@ -7,6 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-08-15
+
+### 🏗️ Changed — relay 架构重写(OpenSpec 规格:`openspec/changes/relay-architecture/`)
+
+**核心:删除 placeholder/real 双 backend 切换,改为"本地 TCP 中继 + 单常驻 backend"。**
+依据:实测 playwright-mcp 单实例在 `browser_close` 后可完全复用(再次 navigate 自动
+重建 context),"每次 endpoint 变化就重启 backend"的前提不必要;v0.1.1 的两个已修
+缺陷(rearm 握手缺失、缓冲请求悬挂)都发生在切换逻辑上。
+
+- **新增 `bin/zcode-cdp-relay.js`(TCP 中继)**:backend 的 endpoint 永远指向
+  `127.0.0.1` 随机端口的中继;Chrome 起停/端口轮换只改 upstream。无 upstream 时
+  **挂起**新连接(默认 30s 超时,`CDP_RELAY_HOLD_MS`),attach 后接通 —— 挂起语义
+  天然替代应用层请求缓冲
+- **proxy 重写**(`bin/zcode-cdp-proxy.js`):状态机 9 态收敛为
+  IDLE/ENSURING/ACTIVE/CLOSING(+退出);整体删除 synthetic initialize、
+  activationBatch(exactly-once 去重)、backend generation fencing、
+  restartPlaceholder 等切换配套;backend 从生到死只 spawn 一次(激活循环零重启,
+  每次 close→reopen 省约 1-2s)
+- **新增 CLOSING 过渡态**:close 释放窗口内到达的 `browser_close` 直接返回成功,
+  防止触发 backend 重连 → 挂起 → 误自动重新激活(L2 回测在真实时序下抓出的
+  行为缺口,旧架构 `CLOSE_PENDING` 的等价物)
+- **teardown 自动重激活**:释放期间到达的新请求(中继挂起连接)在释放完成后自动
+  重新 ensure,等价旧 activationBatch 重放
+- **stdout 限流熔断改为丢弃+告警**:大 snapshot 是合法场景,不再杀 backend
+  (单常驻实例下杀 = proxy 死);CPU 异常仍由三层看门狗兜底
+- **保留不动**(事故换来的资产):lease.js、cdp-takeover、三层看门狗、stderr 限流、
+  inBuf 上限、启动期同父去重、orphan 业务心跳、EPIPE 纯同步退出
+- lease.js:`killAgentChrome` 增加关键路径日志(非 Agent 不杀/SIGTERM 滞留/SIGKILL 兜底)
+
+### Added
+- 回测新增 **L1.5 relay 单元**(`test/relay.test.js`:挂起/接通/双向转发/
+  detach-重挂/端口轮换/failHeld/超时/stop 八场景)
+- L2 新增**回归#3(backend 只 spawn 一次)**断言;stub-backend 增加 TCP 连接模拟
+  (收到 `browser_*` 时连中继,覆盖中继路径);close 释放断言改轮询最终一致
+
+### Verified
+- `npm test` 三连跑全绿(L0 14 + L1 12 + L1.5 8 + L2 11)
+- 半 live:真 playwright-mcp + 真 Chrome(9224):navigate → close(锁释放) →
+  再 navigate(同 backend 重新激活) → close,WS over 中继真实转发,零 Chrome 残留
+
+### Known issues
+- L2 stub 环境下偶发 teardown 轮询的 timer 调度延迟(Heisenbug,注入观察即消失);
+  干净实验与半 live 多轮正常;无资源泄漏;根因未定位(疑 node `execSync` 嵌套
+  事件循环交互),详见 `docs/backtest.md` 已知问题节
+
+## [0.1.1] — 2026-08-15
+
 ### Added
 - **标准回测(回归验证)体系** — `npm test` 一键跑三层,零真实 Chrome 副作用(详见 `docs/backtest.md`)
   - **L0 静态自检**(`test/backtest.sh`):语法 + 契约 marker(`chrome-takeover` 运行时 marker、9223-9229 端口池、默认锁路径、bin 四入口)
@@ -55,5 +102,7 @@ Open-sourced the internal Chrome DevTools Protocol takeover framework that has b
 
 See [`docs/watchdog-postmortem.md`](docs/watchdog-postmortem.md) for the full story.
 
-[Unreleased]: https://github.com/Lumos-789/zcode-cdp/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/Lumos-789/zcode-cdp/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/Lumos-789/zcode-cdp/releases/tag/v0.2.0
+[0.1.1]: https://github.com/Lumos-789/zcode-cdp/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/Lumos-789/zcode-cdp/releases/tag/v0.1.0

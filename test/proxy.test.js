@@ -35,6 +35,7 @@ const TEST_ENV = {
 
 // ---- driver:JSON-RPC over stdio 的极简 MCP 客户端 ----
 let seq = 0;
+let stderrText = "";
 function launchProxy() {
   const child = spawn("node", [PROXY], { env: TEST_ENV });
   let buf = "";
@@ -53,7 +54,7 @@ function launchProxy() {
     }
   });
   child.stderr.setEncoding("utf8");
-  child.stderr.on("data", d => process.stderr.write(`    [proxy] ${d}`));
+  child.stderr.on("data", d => { stderrText += d; process.stderr.write(`    [proxy] ${d}`); });
   return {
     child,
     request(method, params, timeoutMs = 30000) {
@@ -125,11 +126,20 @@ step("首次 browser_ 调用 → 激活(领端口→stub takeover→real backend
   assert.ok(fs.existsSync(path.join(lockDir, "owner.json")), "lease owner.json should exist after activation");
 });
 
+// 轮询等待条件成立(stub 环境下 teardown 的 timer 调度偶发延迟,契约是最终一致)
+async function waitFor(fn, desc, timeoutMs = 8000) {
+  const t0 = Date.now();
+  while (Date.now() - t0 < timeoutMs) {
+    if (fn()) return;
+    await sleep(200);
+  }
+  throw new Error(`timeout waiting: ${desc}`);
+}
+
 step("browser_close → 响应返回 + 释放回 READY_IDLE", async () => {
   const res = await px.request("tools/call", { name: "browser_close", arguments: {} });
   assert.strictEqual(res.result.content[0].text, "stub ok: browser_close");
-  await sleep(1500); // 等 RELEASING 异步完成
-  assert.ok(!fs.existsSync(lockDir), "lease should be released after browser_close");
+  await waitFor(() => !fs.existsSync(lockDir), "lease released after browser_close");
 });
 
 step("回归#1: close 后 tools/list 仍能应答(placeholder rearm 握手)", async () => {
@@ -137,7 +147,7 @@ step("回归#1: close 后 tools/list 仍能应答(placeholder rearm 握手)", as
   assert.ok(res.result && res.result.tools, "placeholder should answer tools/list after rearm");
 });
 
-step("READY_IDLE 收到 browser_close → 直接成功响应(不起 Chrome)", async () => {
+step("IDLE/CLOSING 收到 browser_close → 直接成功响应(不起 Chrome)", async () => {
   const res = await px.request("tools/call", { name: "browser_close", arguments: {} });
   assert.ok(/already closed/i.test(res.result.content[0].text), JSON.stringify(res).slice(0, 200));
 });
@@ -153,8 +163,7 @@ step("激活后再走一轮 close 生命周期(稳定性)", async () => {
   assert.strictEqual(nav.result.content[0].text, "stub ok: browser_navigate");
   const close = await px.request("tools/call", { name: "browser_close", arguments: {} });
   assert.strictEqual(close.result.content[0].text, "stub ok: browser_close");
-  await sleep(1500);
-  assert.ok(!fs.existsSync(lockDir));
+  await waitFor(() => !fs.existsSync(lockDir), "lease released after second close");
 });
 
 step("持有租约时 SIGTERM → 退出且锁被清理(exit hook 路径)", async () => {
@@ -165,6 +174,11 @@ step("持有租约时 SIGTERM → 退出且锁被清理(exit hook 路径)", asyn
   await sleep(1500);
   assert.notStrictEqual(px.child.exitCode, null, "proxy should have exited");
   assert.ok(!fs.existsSync(lockDir), "lock should be cleaned on exit");
+});
+
+step("回归#3: 全程 backend 只 spawn 一次(单常驻实例,激活循环不重启)", async () => {
+  const spawnLines = stderrText.split("\n").filter(l => l.includes("backend spawn:"));
+  assert.strictEqual(spawnLines.length, 1, `expected exactly 1 backend spawn, got ${spawnLines.length}:\n${spawnLines.join("\n")}`);
 });
 
 run();

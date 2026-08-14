@@ -46,6 +46,9 @@ grep -q '/tmp/zcode-cdp/ports' bin/zcode-cdp-lease.js \
 grep -q 'zcode-cdp-lease.js' bin/zcode-cdp-proxy.js \
   && ok "契约: proxy require lease(同目录)" \
   || bad "契约: proxy require lease(同目录)"
+grep -q 'zcode-cdp-relay.js' bin/zcode-cdp-proxy.js \
+  && ok "契约: proxy require relay(中继模块)" \
+  || bad "契约: proxy require relay(中继模块)"
 grep -q -- '--managed' bin/cdp-takeover && grep -q -- '--lease-id' bin/cdp-takeover \
   && ok "契约: takeover managed 模式参数" \
   || bad "契约: takeover managed 模式参数"
@@ -56,6 +59,10 @@ node -e "const p=require('./package.json');for(const f of Object.values(p.bin)){
 echo ""
 echo "===== L1 lease 单元(隔离锁根,无 Chrome)====="
 if node test/lease.test.js; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); fi
+
+echo ""
+echo "===== L1.5 relay 单元(TCP 中继,纯内存)====="
+if node test/relay.test.js; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); fi
 
 echo ""
 echo "===== L2 proxy 状态机(stub backend/takeover 端到端)====="

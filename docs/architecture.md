@@ -15,8 +15,9 @@
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
 │                          第 1 层：能力层 (MCP)                           │
-│   zcode-cdp-proxy.js —— 状态机驱动的懒加载 MCP 代理                      │
-│   每个会话独立 spawn 一个；持有 stdio，背后懒挂 playwright-mcp            │
+│   zcode-cdp-proxy.js —— 懒加载 MCP 代理(请求观察者 + Chrome 生命周期)      │
+│   zcode-cdp-relay.js —— 本地 TCP 中继(backend 的 endpoint 永远有效)       │
+│   每个会话独立 spawn 一个；持有 stdio，背后常驻一个 playwright-mcp          │
 └──────────────────────────────┬──────────────────────────────────────────┘
                                │ 首次 browser_* 调用时才下沉
                                ▼
@@ -38,21 +39,29 @@
 
 ### 两条数据路径
 
-**路径 A：MCP 工具调用（agent 驱动，懒加载）**
+**路径 A：MCP 工具调用（agent 驱动，懒加载，relay 架构）**
 
 ```
 agent 决定调 browser_navigate
         │
-        ▼  JSON-RPC over stdio
-zcode-cdp-proxy.js  (state machine)
-        │  首次 browser_* → RESERVING → STARTING_BROWSER → STARTING_BACKEND → ACTIVE
+        ▼  JSON-RPC over stdio(全双工透传,proxy 只观察不代办)
+zcode-cdp-proxy.js  (请求观察者 + Chrome 生命周期管理)
+        │  首次 browser_* → ENSURING: reserve → cdp-takeover → relay.attach → ACTIVE
         ├─► zcode-cdp-lease.js   reserve()  领端口 9223-9229
         ├─► cdp-takeover --managed --lease-id <id>   起 Chrome
-        └─► spawn 真 playwright-mcp（--cdp-endpoint http://127.0.0.1:<port>）
-                │
-                ▼  JSON-RPC over stdio（proxy 透传）
-            playwright-mcp ──CDP──► Chrome（端口 922x）
+        └─► 常驻 playwright-mcp(会话期只 spawn 一次)
+                │  endpoint 永远指向本地 TCP 中继(127.0.0.1 随机端口)
+                ▼
+        zcode-cdp-relay.js —— 无状态字节管道
+                │  无 upstream 时挂起新连接(带超时);attach 后接通
+                ▼  WebSocket/HTTP over TCP
+            Chrome(端口 922x,动态)
 ```
+
+backend 从生到死只 spawn 一次;Chrome 的起停、端口轮换全部发生在中继的 upstream
+侧,backend 无感知(对它只是断线重连——2026-08-15 实验证实 playwright-mcp 的
+`browser_close` 后可完全复用)。**中继的挂起语义天然替代了应用层请求缓冲**:
+ensure 进行期间 backend 发起的连接被挂起,Chrome 就绪后自然流动,零缓冲代码。
 
 **路径 B：直连客户端（用户脚本，固定端口）**
 
@@ -89,7 +98,7 @@ navigate("https://example.com")  →  click(登录按钮)  →  type(密码)  �
 
 skill 做不到这件事，因为 skill 没有"持有进程"的能力。引用 proxy.js 顶部注释原文：
 
-> 替代 playwright-mcp 作为 config.json 里 cdp 的 command。每个 ZCode 会话独立 spawn 一个本 proxy 实例。proxy 全权持有 stdio(MCP JSON-RPC 通道)，背后懒挂一个 playwright-mcp 进程。
+> 替代 playwright-mcp 作为 config.json 里 cdp 的 command。每个 ZCode 会话独立 spawn 一个本 proxy 实例。proxy 全权持有 stdio(MCP JSON-RPC 通道)，背后常驻一个 playwright-mcp 进程(endpoint 指向本地中继)。
 
 如果只写一个 skill 教 agent "去 spawn 一个 Chrome"，agent 每次调用都得自己想办法管这个 Chrome 的生命周期，跨调用状态完全无法保持。MCP 把这层复杂性藏在 daemon 里，agent 看到的就是干净的 `browser_*` 工具。
 
@@ -97,121 +106,129 @@ skill 做不到这件事，因为 skill 没有"持有进程"的能力。引用 p
 
 ## 3. 状态机详解（核心）
 
-整个 proxy 的行为由一个显式状态机驱动（`bin/zcode-cdp-proxy.js:80-109`）。状态机保证：在错误的时间收到的请求不会造成破坏（比如激活中收到的请求会被缓冲，不会丢也不会重复执行）。
+proxy 是一个**请求观察者**：所有 client→backend 消息照常透传，仅解析后观察
+`browser_*` 调用并驱动 Chrome 生命周期。状态机只管 Chrome 的在/不在（
+`bin/zcode-cdp-proxy.js` 的 `ST` 定义）。
+
+> **架构演进注**：v0.1.x 采用 placeholder/real 双 backend 切换 + synthetic
+> initialize + activation batch + generation fencing 四件套（9 状态）。v0.2.0
+> 起实测 playwright-mcp 的 `browser_close` 后可完全复用，遂改为"本地 TCP 中继 +
+> 单常驻 backend"，四件套整体删除（变更规格见 `openspec/`，回归验证见
+> `docs/backtest.md`）。下文描述当前架构。
 
 ### 状态定义
 
 | 状态 | 含义 |
 |------|------|
-| `BOOTING` | 启动期，还没 spawn 占位 backend |
-| `READY_IDLE` | 占位 backend 就绪，0 端口 0 Chrome，只应答 `initialize`/`tools/list` |
-| `RESERVING` | 正在领端口租约 |
-| `STARTING_BROWSER` | 正在起 Chrome（调 `cdp-takeover`） |
-| `STARTING_BACKEND` | 正在起真 playwright-mcp + 内部握手 |
-| `ACTIVE` | 真 backend 就绪，正常透传工具调用 |
-| `CLOSE_PENDING` | 已转发 `browser_close`，等响应返回后释放 |
-| `RELEASING` | 正在杀 Chrome + 删锁 + 重启占位 |
+| `IDLE` | 0 端口租约 0 Chrome;backend 常驻应答 `initialize`/`tools/list` |
+| `ENSURING` | 正在领租约 + 起 Chrome + 接通中继(期间请求靠中继挂起语义流动) |
+| `ACTIVE` | Chrome 在线,中继已接通,一切透传 |
+| `CLOSING` | `browser_close` 响应已返回、租约/中继正在释放的过渡窗口 |
 | `SHUTTING_DOWN` | 退出中（stdin EOF/SIGTERM/SIGINT/SIGHUP） |
 | `EXITED` | 已退出 |
 
 ### 状态流转图
 
 ```
-                              ┌─────────────┐
-                              │   BOOTING   │
-                              └──────┬──────┘
-                                     │ spawn 占位 backend
-                                     ▼
-        ┌──────────────────────► READY_IDLE ◄──────────────────────┐
-        │                       └──┬─────────┘                      │
-        │                          │ 首次 browser_*                  │
-        │                          ▼                                │
-        │                    ┌───────────┐                          │
-        │                    │ RESERVING │──── lease 失败 ──► failActivation ──► READY_IDLE
-        │                    └─────┬─────┘                          ▲
-        │                          │ lease OK                        │
-        │                          ▼                                │
-        │                ┌────────────────────┐                     │
-        │                │ STARTING_BROWSER   │──── Chrome 起不来 ──┘
-        │                └─────────┬──────────┘
-        │                          │ Chrome 就绪
-        │                          ▼
-        │                ┌────────────────────┐
-        │                │ STARTING_BACKEND   │──── backend 启动期退出 ──► failActivation ──► READY_IDLE
-        │                └─────────┬──────────┘      （synthetic initialize 失败）
-        │                          │ 握手完成 + flush batch
-        │                          ▼
-        │                      ┌────────┐
-        │      browser_close   │ ACTIVE │──── Chrome 异常 / backend 死 ──► handleBackendFailure ──┐
-        │   ┌─────────────────►└───┬────┘                                                          │
-        │   │                      │ 记录 closeRequestId, 转 CLOSE_PENDING                          │
-        │   │                      ▼                                                                │
-        │   │              ┌───────────────┐                                                        │
-        │   │              │ CLOSE_PENDING │                                                        │
-        │   │              └──────┬────────┘                                                        │
-        │   │                     │ 收到 close 响应 → 先返回给 ZCode                                 │
-        │   │                     ▼                                                                  │
-        │   │              ┌────────────┐                                                            │
-        │   │              │ RELEASING  │                                                            │
-        │   │              └─────┬──────┘                                                            │
-        │   │                    │ 杀 Chrome + 删锁 + 重启占位                                       │
-        │   └────────────────────┼──────────────────────────────────────────────────────────────────┘
-        │                        │
-        └────────────────────────┘  (回 READY_IDLE)
+        ┌────────────────────────────────────────────────┐
+        │                                                │
+        ▼                                                │
+     ┌───────┐  首次 browser_*(非 close)  ┌───────────┐  │
+  ┌─►│ IDLE  │ ─────────────────────────► │ ENSURING  │  │
+  │  └───────┘                             └─────┬─────┘  │
+  │      ▲  ▲        lease 失败/Chrome 起不来:        │      │
+  │      │  └──────────── failHeld + 回 IDLE ◄────────┤      │
+  │      │                                          ensure 成功│
+  │      │  teardown 完成(锁删+中继断)                   ▼      │
+  │      │  有挂起连接 → 自动重新 ensure ────────► ┌────────┐ │
+  │      └────────────────────────────────────────│ ACTIVE │ │
+  │             ▲                                 └───┬────┘ │
+  │             │      browser_close 响应返回:          │      │
+  │             │      先转发响应,再 teardown      ┌────▼─────┐│
+  │             └──────────────────────────────── │ CLOSING  ││
+  │                                               └──────────┘│
+  │   IDLE/CLOSING 收到 browser_close → 直接成功响应(不起 Chrome)│
+  └───────────────────────────────────────────────────────────┘
 
-   任何状态  ──── stdin EOF / SIGTERM / SIGINT / SIGHUP ────►  SHUTTING_DOWN  ────►  EXITED
+   任何状态  ──── stdin EOF / SIGTERM / SIGINT / SIGHUP ────►  SHUTTING_DOWN ────► EXITED
 ```
 
 ### 关键设计点
 
-**1. READY_IDLE 时只有占位 backend，不起 Chrome。** proxy 一启动就 spawn 一个"占位"playwright-mcp，它的 `--cdp-endpoint` 指向 `http://127.0.0.1:1`（无效地址，`PLACEHOLDER_ENDPOINT`，见 `zcode-cdp-proxy.js:56`）。占位 backend 只负责应答 `initialize` 和 `tools/list`，绝不真正碰 CDP。所以**开 N 个不碰浏览器的 ZCode 窗口 = 0 个 Chrome 进程、0 个端口被领**——这是资源节约的根本机制。
+**1. IDLE 时零占用，但 backend 常驻。** proxy 启动时开 TCP 中继（随机端口）并
+spawn 唯一的 playwright-mcp（endpoint=中继）。不碰浏览器的会话 = 0 端口租约
+0 Chrome；backend 进程与旧架构的"占位 backend"成本相同（1 个 playwright-mcp），
+但**激活/关闭循环不再重启它**（旧架构每次循环杀+起各一次，浪费 1-2 秒）。
 
-**2. 首次 `browser_*` 才激活。** `handleClientLine` 检测到 `tools/call` 且方法名以 `browser_` 开头时（`zcode-cdp-proxy.js:780`），把请求入 `activationBatch`，触发 `startActivation` → `doActivate`。激活流程五步（`zcode-cdp-proxy.js:311-377`）：
+**2. 首次 `browser_*` 才激活，请求不缓冲。** `handleClientLine` 观察到
+`browser_*`（非 close）且 IDLE 时，异步触发 `ensure()`（reserve →
+cdp-takeover → relay.attach），**请求本身照常转发**——backend 连中继时因无
+upstream 被挂起（上限 `CDP_RELAY_HOLD_MS`，默认 30s），Chrome 就绪后自然流动。
+中继挂起语义替代了旧架构的 activation batch：零缓冲代码，时序天然正确。
 
-```
-RESERVING          领端口（lease.reserve）
-STARTING_BROWSER   起 Chrome（cdp-takeover --managed，最多重试 5 次）
-STARTING_BACKEND   杀占位 → 起真 backend（--cdp-endpoint 指向真实端口）
-                   synthetic initialize 内部握手
-ACTIVE             flush activationBatch（exactly-once）
-```
+**3. `browser_close` 先返回响应再释放。** ACTIVE 态收到 close：转发并记录
+`closeRequestId`；backend 输出该 id 的响应时，**先把响应写给 ZCode**，再异步
+`teardown()`（断中继 → 释放租约[内含杀 Agent Chrome] → 回 IDLE）。agent 看到
+的是"close 成功"，而非超时。
 
-**3. `browser_close` 先返回响应再释放。** 见 `zcode-cdp-proxy.js:819-825, 254-264`：进入 `CLOSE_PENDING`，转发请求并记下 `closeRequestId`；当 backend 输出该 id 的响应时，**先把响应写给 ZCode**，再异步 `releaseAfterClose`。这样 agent 看到的是"close 成功"，而不是"close 超时/无响应"。
+**4. CLOSING 窗口防御。** 释放进行中（租约未删、state 仍 CLOSING）到达的
+`browser_close` 直接返回成功（浏览器确实在关闭中），不转发——否则会触发
+backend 重连中继 → 挂起连接 → teardown 完成时误判"有新需求"而重新激活
+（旧架构 `CLOSE_PENDING` 状态挡的就是这个窗口，v0.2 的等价物；该行为缺口由
+L2 回测抓出后修复）。
 
-**4. Chrome 异常不自动重放。** 任何异常（real backend 退出、Chrome listener 消失、stdout 限流熔断）都走 `handleBackendFailure`：当前调用失败、释放租约、回 `READY_IDLE`。**不会重放**刚才的请求——因为重放可能导致"重复提交订单/重复发帖"。agent 自己决定要不要重试。
+**5. teardown 的自动重激活 = 旧 batch 重放的等价语义。** teardown 完成时若中继
+仍有挂起连接（释放期间到达的新 `browser_*` 触发 backend 重连），自动重新
+`ensure()`——挂起连接在新 Chrome 就绪后自然流动，无需应用层重放。
 
-**5. READY_IDLE 收到 `browser_close` 直接返回成功。** 不需要起 Chrome 来关 Chrome（`zcode-cdp-proxy.js:786-797`）。
+**6. Chrome 异常不自动重放。** 健康检查发现 Chrome listener 消失/变为非 Agent
+进程 → teardown 回 IDLE（**不杀非 Agent 进程**）。不重放刚才的请求——重放可能
+导致重复提交。agent 自己决定要不要重试。backend 死亡是唯一致命异常：proxy
+直接退出让 ZCode 重拉（唯一实例，无法降级服务）。
 
 ---
 
-## 4. 关键正确性修复（vs 朴素实现）
+## 4. 关键正确性设计（vs 朴素实现）
 
-一个"朴素实现"会直接把 stdio 桥接到 playwright-mcp，再起个 Chrome。这在生产里会出各种竞态。proxy.js 头部注释列了五条关键修复（`zcode-cdp-proxy.js:18-24`），逐条解释：
+一个"朴素实现"会直接把 stdio 桥接到 playwright-mcp，再起个 Chrome。这在生产里会出各种竞态。当前架构的关键设计：
 
-### 4.1 exactly-once enqueue（精准一次入队）
+### 4.1 本地 TCP 中继（`bin/zcode-cdp-relay.js`）
 
-激活期间（`RESERVING` / `STARTING_BROWSER` / `STARTING_BACKEND`）到达的所有请求，无论是否 `browser_*`，都进 `activationBatch`，且**去重**（按原始行比对，`zcode-cdp-proxy.js:813`）。激活完成后一次性 flush 给真 backend。这保证：
+**为什么需要**：playwright-mcp 的 `--cdp-endpoint` 是启动参数，运行时不可改；而
+MCP 客户端只在连接建立时发一次 `initialize`。若要让 endpoint 跟随动态分配的
+Chrome 端口，就得反复重启 backend 并伪造握手（v0.1.x 的四件套复杂度来源）。
+中继让 endpoint **永远有效**：backend 的 endpoint 固定指向中继，Chrome 端口只
+存在于 upstream 侧。
 
-- 激活期间到达的请求不会丢（不会因为 backend 还没起好就被拒绝）。
-- 不会重复执行（同一个请求不会被转发两次）。
+**语义**：纯字节管道（`pipe` 双向，零解析，每条连接独立 upstream，支持
+playwright 多连接）；无 upstream 时**挂起**新连接（不拒绝、不报错，上限
+`CDP_RELAY_HOLD_MS` 默认 30s——ensure 失败时 `failHeld()` 销毁挂起连接，backend
+收到连接错误，对应旧架构"激活失败对每个请求返回一次 error"）；`detach()` 只销毁
+已接通管道，挂起连接保留——teardown 期间到达的新请求在新一轮 attach 后自然流动。
 
-### 4.2 synthetic initialize（内部握手）
+### 4.2 挂起语义替代应用层缓冲
 
-真 backend 起来后，**不能直接 flush 工具请求**——playwright-mcp 要求先完成 MCP 握手（`initialize` → `notifications/initialized`）才会处理后续请求。但 ZCode 已经和占位 backend 握过手了，不会再来一次。
-
-解法（`zcode-cdp-proxy.js:271-301`）：proxy 自己用特殊 id `__cdp_proxy_synthetic_init__` 发一个 `initialize`，收到响应后**吞掉**（不转发给 ZCode），再发 `notifications/initialized`，然后才 flush batch。`handleBackendLine` 会拦截这个 id（`zcode-cdp-proxy.js:243-252`）。
+旧架构需要 `activationBatch`（exactly-once 入队、去重、激活失败批量 settle）。
+新架构里 ensure 期间的请求**照常转发**：backend 连中继 → 挂起 → Chrome 就绪 →
+attach 接通 → 请求流动。缓冲、去重、结算代码整体消失，时序由 TCP 连接状态保证。
 
 ### 4.3 browser_close response-aware（先响应后释放）
 
-见上文 §3 设计点 3。`handleBackendLine` 检测 `closeRequestId` 匹配的响应，先 `process.stdout.write` 给 ZCode，再 `serialize(() => releaseAfterClose())`（`zcode-cdp-proxy.js:255-264`）。顺序至关重要：先释放会导致 agent 收不到响应。
+`handleBackendLine` 检测 `closeRequestId` 匹配的响应，先 `process.stdout.write`
+给 ZCode，再 `serialize(() => teardown())`。顺序至关重要：先释放会导致 agent
+收不到响应。
 
-### 4.4 backend generation fencing（世代隔离）
+### 4.4 CLOSING 窗口防御
 
-`backendGeneration` 是个单调递增计数器，每次 spawn backend 都自增（`zcode-cdp-proxy.js:135`）。`wireBackendOutput` 给每个 backend 闭包绑定它自己的 generation，输出回调里检查 `if (backend !== b) return`（`zcode-cdp-proxy.js:210`）——**旧 placeholder 迟到的输出不会污染新 real backend 的 stdout 流**。这在 placeholder 被杀但 stdout buffer 里还有残余数据时尤其重要。
+释放是异步的（杀 Chrome 最多 3s）。窗口内到达的 `browser_close` 若走真转发，
+会触发 backend 重连中继 → 挂起 → teardown 完成时误判新需求 → 无限激活循环。
+CLOSING 态直接回成功响应，语义上"浏览器正在关闭"与"已关闭"等价。（该缺口由
+L2 回测在真实时序下抓出。）
 
-### 4.5 激活失败 settle batch（批量结算）
+### 4.5 防护机制（三层看门狗 + 限流，v0.1 事故结晶，原样保留）
 
-激活失败时（lease 失败、Chrome 起不来、backend 启动期退出），`failActivation` 调 `settleBatch`：对 `activationBatch` 里**每个有 id 的 request 各返回一次 error**，然后清空 batch（`zcode-cdp-proxy.js:425-463`）。这保证 agent 每个挂起的请求都拿到一次明确答复（不会无限挂起，也不会答复两次），然后回 `READY_IDLE` 等下次调用。
+stdout 限流超限改为**丢弃 + 告警**（大 snapshot 是合法场景），不再杀 backend
+（唯一实例，杀 = proxy 死）；CPU 异常交由三层看门狗兜底（§7）。
 
 ---
 
@@ -373,9 +390,10 @@ proxy 是长驻进程，最大的事故风险是**主线程 busy-loop（99% CPU 
 
 | 文件 | 行数 | 职责 |
 |------|------|------|
-| `bin/zcode-cdp-proxy.js` | 979 | 状态机驱动的懒加载 MCP 代理（核心） |
-| `bin/zcode-cdp-lease.js` | 455 | 统一端口租约管理（原子 mkdir + leaseId） |
-| `bin/cdp-takeover` | 279 | Chrome 启动器（durable / managed 双模式 + profile rsync） |
-| `bin/cdpcc` | 86 | Claude Code 启动 wrapper（注入 cdp MCP 配置 + 预占端口） |
+| `bin/zcode-cdp-proxy.js` | ~700 | 懒加载 MCP 代理：请求观察 + ensure/teardown + 看门狗（核心） |
+| `bin/zcode-cdp-relay.js` | ~120 | 本地 TCP 中继：挂起语义、attach/detach、纯字节管道 |
+| `bin/zcode-cdp-lease.js` | ~460 | 统一端口租约管理（原子 mkdir + leaseId） |
+| `bin/cdp-takeover` | ~280 | Chrome 启动器（durable / managed 双模式 + profile rsync） |
+| `bin/cdpcc` | ~100 | Claude Code 启动 wrapper（注入 cdp MCP 配置 + 预占端口） |
 
-详细看门狗事故复盘见 `docs/watchdog-postmortem.md`。
+详细看门狗事故复盘见 `docs/watchdog-postmortem.md`；变更规格与验收见 `openspec/` 与 `docs/backtest.md`。

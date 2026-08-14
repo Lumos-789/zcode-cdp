@@ -1,6 +1,6 @@
 {
   "name": "zcode-cdp",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Take over a real, already-logged-in Chrome for your AI coding agent via Chrome DevTools Protocol — with production-grade port lease, watchdog, and state-machine governance.",
   "license": "MIT",
   "author": "Lumos-789",

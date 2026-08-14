@@ -237,14 +237,22 @@ function removeLegacyLock(port) {
 async function killAgentChrome(port) {
   let pid = portPid(port);
   if (!pid) return;
-  if (!isAgentChromePid(pid)) return; // 非 Agent 永不杀
+  if (!isAgentChromePid(pid)) {
+    try { process.stderr.write(`[lease] 端口 ${port} listener PID ${pid} 非 Agent Chrome,不杀\n`); } catch {}
+    return; // 非 Agent 永不杀
+  }
   try { process.kill(pid, "SIGTERM"); } catch {}
   for (let i = 0; i < 10; i++) {
     await sleep(300);
-    if (!portPid(port)) return;
+    const cur = portPid(port);
+    if (!cur) return;
+    if (i === 0) {
+      try { process.stderr.write(`[lease] 端口 ${port} SIGTERM 后 300ms 仍在监听(PID ${cur}),继续等待\n`); } catch {}
+    }
   }
   pid = portPid(port);
   if (pid && isAgentChromePid(pid)) {
+    try { process.stderr.write(`[lease] 端口 ${port} SIGTERM 超时 3s → SIGKILL PID ${pid}\n`); } catch {}
     try { process.kill(pid, "SIGKILL"); } catch {}
   }
 }

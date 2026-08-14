@@ -32,7 +32,7 @@
 |---|------|------------------|
 | 1 | **登录态丢失** —— 通用方案每次起全新浏览器，登录态/2FA/Cookie 全得重来 | 接管真人 Chrome：首次 `rsync` 日常 Chrome profile 继承全部登录态，之后独立演化 |
 | 2 | **多 agent 并发抢端口** —— N 个会话同时连 9222 互相踩 | 统一端口租约池（9223–9229 共 7 槽），原子 `mkdir` 抢锁 + `leaseId` ownership 校验，杜绝双 owner 竞态 |
-| 3 | **僵尸 Chrome 吃内存** —— 开 5 个 agent 窗口其中 3 个不碰浏览器，却挂了 3 份 Chrome | 状态机懒加载：`READY_IDLE` 态占位 backend 指向无效地址，**不碰浏览器的窗口 = 0 Chrome 进程** |
+| 3 | **僵尸 Chrome 吃内存** —— 开 5 个 agent 窗口其中 3 个不碰浏览器，却挂了 3 份 Chrome | 懒加载：首次 `browser_*` 调用才起 Chrome，**不碰浏览器的窗口 = 0 Chrome 进程** |
 | 4 | **孤儿进程烧 CPU** —— agent 崩溃后 Chrome/proxy 残留，单核 99% 跑几小时 | 三层看门狗（软 CPU lag / 孤儿超时 / 硬 worker 线程 SIGKILL），扛过两次真实生产事故（见 [事故复盘](docs/watchdog-postmortem.md)） |
 | 5 | **重复提交/发布** —— 网络抖动触发自动重放，导致同一篇文章发两次 | Chrome/backend 异常**不自动重放**，下次 `browser_*` 再懒启动；exactly-once 入队 |
 | 6 | **反爬识别 bot 指纹** —— stealth 插件反而暴露自动化 | 连真 Chrome 指纹本就真，禁 stealth / 禁 `new_context` / 禁覆盖 UA（详见 [反爬与编辑器踩坑](docs/platform-notes.md)） |
@@ -53,12 +53,12 @@
 ## 核心特性
 
 - 🔑 **接管真人已登录 Chrome** —— takeover profile 通过 `rsync` 从日常 Chrome 继承登录态，之后独立演化；`--refresh` 可随时强制刷新。
-- 🧠 **状态机懒加载 proxy** —— `READY_IDLE → RESERVING → STARTING_BROWSER → STARTING_BACKEND → ACTIVE`；开 N 个不碰浏览器的窗口 = **0 个 Chrome 进程**。
+- 🧠 **中继懒加载 proxy** —— 本地 TCP 中继 + 单常驻 backend，状态机 `IDLE → ENSURING → ACTIVE → CLOSING → IDLE`；开 N 个不碰浏览器的窗口 = **0 个 Chrome 进程**，激活循环不重启 backend。
 - 🔒 **端口租约与所有权** —— 统一 `mkdir` 原子抢锁 + `leaseId` 校验，防 PID 复用误删新锁；proxy / cdpcc / cdp-takeover 共享同一锁命名空间，杜绝双 owner 竞态。
 - 🐕 **三层看门狗** —— 软看门狗（事件循环延迟）/ CPU 看门狗（主进程 CPU% busy-loop 检测）/ 硬看门狗（独立 worker 线程，60s 无心跳即 `SIGKILL`，免疫主线程卡死）。
 - 🧰 **三种客户端通道** —— MCP 工具（`mcp__cdp__browser_*`）/ 裸 WebSocket / Playwright `connect_over_cdp`，三种客户端共享同一端口池。
 - 🎭 **每端口 profile 隔离** —— 每个端口独立 profile + 不同卡通头像，多账号天然隔离，一眼分清哪个 Chrome 属于哪个会话。
-- 🧹 **exactly-once 语义** —— 激活期间到达的请求只入队一次；backend generation fencing 防止旧 placeholder 迟到输出污染新 backend。
+- 🧹 **挂起语义替代缓冲** —— 激活期间 backend 连接在中继挂起，Chrome 就绪后自然流动；零应用层缓冲代码。
 
 ---
 
@@ -81,7 +81,7 @@
 │  ┌──────────────────┐  ┌────────────────────┐     │                  │
 │  │ zcode-cdp-proxy   │  │  cdpcc             │     │                  │
 │  │ (状态机懒加载)     │  │  (CC 端口预占)      │     │                  │
-│  │ READY_IDLE→ACTIVE│  │  + cdp-ensure hook │     │                  │
+│  │  IDLE→ACTIVE  │  │  + cdp-ensure hook │     │                  │
 │  └────────┬─────────┘  └─────────┬──────────┘     │                  │
 │           │                       │                │                  │
 │           └───────────┬───────────┘                │                  │
@@ -172,7 +172,7 @@
 
 | 模式 | 谁用 | 怎么起 | 生命周期 | 典型场景 |
 |---|---|---|---|---|
-| **ZCode lazy proxy** | ZCode 会话 | MCP 自动（写好 config 即生效） | 首次调用懒启动；`browser_close` 释放，回到 `READY_IDLE` | ZCode agent 日常浏览/操作 |
+| **ZCode lazy proxy** | ZCode 会话 | MCP 自动（写好 config 即生效） | 首次调用懒启动；`browser_close` 释放，回到 `IDLE` | ZCode agent 日常浏览/操作 |
 | **cdpcc** | Claude Code | 命令行 `cdpcc [claude args]` | 启动时预占端口（不起 Chrome），首次调 `mcp__cdp__*` 由 hook 起 Chrome；**CC 退出自动关 Chrome** | 给 Claude Code 一个带浏览器的窗口 |
 | **durable** | 人工 / Python 脚本 | `cdp-takeover [port]` | 跨客户端长期存在，直到手动关 | Playwright `connect_over_cdp`、裸 WebSocket 长连接爬取 |
 
@@ -217,14 +217,14 @@ with sync_playwright() as p:
 # agent 会自动调用：
 #   1. mcp__cdp__browser_navigate({ url: "https://your-company-dashboard.example.com" })
 #      ↑ 首次调用，proxy 状态机自动：
-#         READY_IDLE → 领端口 9223 → rsync 你日常 Chrome profile（继承登录态）
+#         IDLE → 领端口 9223 → rsync 你日常 Chrome profile（继承登录态）
 #         → 启动 Agent Chrome → 挂 @playwright/mcp → 工具直达
 #   2. mcp__cdp__browser_snapshot()   ← 读取页面 ARIA 树
 #   3. mcp__cdp__browser_click({ ... })  ← 点开"今日订单" tab（如需要）
 #   4. mcp__cdp__browser_take_screenshot()  ← 视觉确认
 #
 # 关键：因为用的是你已登录的 Chrome，不需要你喂账号密码；
-#       用完调 browser_close，proxy 释放端口回 READY_IDLE（Chrome 关闭）。
+#       用完调 browser_close，proxy 释放端口回 IDLE（Chrome 关闭）。
 ```
 
 **进阶**：同一台机器上 3 个 agent 会话并发？没问题 —— 每个会话独立 spawn 一个 proxy，各自领不同端口（9223 / 9224 / 9225），互不干扰；其中不碰浏览器的会话 = 0 Chrome 进程。
@@ -269,7 +269,7 @@ with sync_playwright() as p:
 | `CDP_INBUF_MAX_BYTES` | `2097152`（2 MB） | stdin inBuf 上限（防无换行堆积） |
 | `CDP_STARTUP_GRACE_MS` | `8000` | 启动宽限期（lease 判定新锁不算 stale） |
 | `CDP_STALE_LOCK_AGE_MS` | `30000` | 锁龄超过此值且 owner 已死 → 视为 stale 回收 |
-| `CDP_PLACEHOLDER_ENDPOINT` | `http://127.0.0.1:1` | `READY_IDLE` 占位 backend 指向的无效地址（确保不真连浏览器） |
+| `CDP_RELAY_HOLD_MS` | `30000` | TCP 中继无 upstream 时挂起新连接的上限（ms）；ensure 失败时挂起连接被销毁，backend 收到连接错误 |
 
 ---
 

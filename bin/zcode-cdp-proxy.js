@@ -1,27 +1,29 @@
 #!/usr/bin/env node
-// zcode-cdp-proxy — ZCode 多会话 CDP 端口池(lazy 版,状态机驱动)
+// zcode-cdp-proxy — ZCode 多会话 CDP 端口池(lazy 版,本地中继架构)
 //
-// 替代 playwright-mcp 作为 config.json 里 cdp 的 command。每个 ZCode 会话独立
-// spawn 一个本 proxy 实例。proxy 全权持有 stdio(MCP JSON-RPC 通道),背后懒挂一个
-// playwright-mcp 进程:
-//   - READY_IDLE:spawn 一个「占位」playwright-mcp(endpoint 指向无效地址),只负责
-//     应答 initialize / tools/list。不领端口、不起 Chrome → 开 N 个窗口其中不碰
-//     CDP 的 = 0 端口 0 Chrome。
-//   - 首次 browser_ 调用 → RESERVING → STARTING_BROWSER → STARTING_BACKEND → ACTIVE
-//   - browser_close → 先返回响应给 ZCode → RELEASING → 回到 READY_IDLE
-//   - Chrome/backend 异常 → 当前调用失败 → 回到 READY_IDLE(不自动重放)
-//   - 退出(stdin EOF/SIGTERM/SIGINT/SIGHUP)→ SHUTTING_DOWN → EXITED
+// 作为 config.json 里 cdp 的 command。每个 ZCode 会话独立 spawn 一个本 proxy。
+// proxy 全权持有 stdio(MCP JSON-RPC 通道),背后挂一个常驻 playwright-mcp:
+//
+// 架构(2026-08-15 relay 重写,取代 placeholder/real 双 backend 切换):
+//   - 启动:在 127.0.0.1 随机端口开一个无状态 TCP 中继,spawn 唯一的
+//     playwright-mcp,endpoint 永远指向中继 → backend 从生到死只起一次。
+//   - 中继:纯字节管道,零解析。无 upstream(Chrome)时挂起新连接(带超时),
+//     upstream 就绪后接通 —— 用连接挂起语义天然替代旧的 activation batch。
+//   - proxy 是 JSON-RPC 观察者:见 browser_* 且无 Chrome → 异步 ensure
+//     (reserve → cdp-takeover → 接通中继);browser_close 响应后 → teardown
+//     (断中继、杀 Chrome、释放租约)。所有消息始终透传。
+//   - 状态机:IDLE → ENSURING → ACTIVE → IDLE(+SHUTTING_DOWN/EXITED)。
+//   - 依据:playwright-mcp 单实例在 browser_close 后可完全复用(实验证实,
+//     见 docs/architecture.md),Chrome 起停/端口轮换对 backend 只是断线重连。
+//
+// 保留的事故防线(勿删,均有真实事故背书,详见 docs/watchdog-postmortem.md):
+//   - 三层看门狗:软(事件循环 lag)/孤儿(业务心跳超时)/硬(worker 线程 SIGKILL)
+//   - stdout/stderr 限流与 buf 上限、stdin inBuf 上限(防 O(n²) 与刷屏)
+//   - 启动期同父进程去重(防 proxy 堆积)
+//   - uncaughtException 纯同步退出(EPIPE 异常风暴教训:绝不写已坏的 stderr)
 //
 // 端口池:9223-9229(7 个会话临时端口)。脚本 durable 端口使用 93xx,不进租约池。
 // 租约:统一使用 zcode-cdp-lease.js 管理(原子 mkdir + leaseId ownership 校验)。
-//
-// 关键正确性修复(vs 旧版):
-//   - exactly-once enqueue:激活期间到达的请求只入队一次
-//   - synthetic initialize:real backend 启动后先内部握手(initialize+initialized),
-//     吞掉内部响应,然后才 flush 工具请求
-//   - browser_close response-aware:先返回响应给 ZCode,再释放整份租约,重启 placeholder
-//   - backend generation fencing:旧 placeholder 迟到输出不会污染新 backend
-//   - 激活失败时对本轮 batch 每个 request 各返回一次 error 并清空
 
 "use strict";
 
@@ -31,6 +33,7 @@ const path = require("path");
 const os = require("os");
 
 const L = require("./zcode-cdp-lease.js");
+const { createRelay } = require("./zcode-cdp-relay.js");
 
 // ---- 可测试性:环境覆盖,生产默认不变 ----
 // 解析 @playwright/mcp 的 cli.js 路径（优先 env，其次 require.resolve 自动发现）
@@ -53,11 +56,11 @@ function resolvePlaywrightMcpCli() {
 const CLI = resolvePlaywrightMcpCli();
 // takeover 脚本与本 proxy 同目录（bin/cdp-takeover）
 const TAKEOVER = process.env.CDP_TAKEOVER || path.join(__dirname, "cdp-takeover");
-const PLACEHOLDER_ENDPOINT = process.env.CDP_PLACEHOLDER_ENDPOINT || "http://127.0.0.1:1";
 const HEALTH_CHECK_INTERVAL_MS = parseInt(process.env.CDP_HEALTH_CHECK_MS || "5000", 10);
+const RELAY_HOLD_MS = parseInt(process.env.CDP_RELAY_HOLD_MS || String(30 * 1000), 10); // 中继无 upstream 时挂起新连接的上限
 
 // ---- 防护阈值(env 可覆盖) ----
-const OUTPUT_RATE_LIMIT = parseInt(process.env.CDP_OUTPUT_RATE_LIMIT || "500", 10);   // backend stdout 行/秒
+const OUTPUT_RATE_LIMIT = parseInt(process.env.CDP_OUTPUT_RATE_LIMIT || "500", 10);   // backend stdout 行/秒(超限丢弃并告警)
 const BUF_MAX_BYTES = parseInt(process.env.CDP_BUF_MAX_BYTES || String(2 * 1024 * 1024), 10); // stdout buf 上限 2MB
 const STDERR_RATE_LIMIT = parseInt(process.env.CDP_STDERR_RATE_LIMIT || "200", 10);   // backend stderr 段/秒
 const ORPHAN_TIMEOUT_MS = parseInt(process.env.CDP_ORPHAN_TIMEOUT_MS || String(30 * 60 * 1000), 10); // 孤儿超时 30min
@@ -78,23 +81,20 @@ function log(...a) {
 function hhmmss() { const d = new Date(); return [d.getHours(), d.getMinutes(), d.getSeconds()].map(n => String(n).padStart(2, "0")).join(":"); }
 
 // ==================== 状态机 ====================
-// BOOTING → READY_IDLE → RESERVING → STARTING_BROWSER → STARTING_BACKEND → ACTIVE
-//          → CLOSE_PENDING → RELEASING → READY_IDLE
-//          → (any) SHUTTING_DOWN → EXITED
+// IDLE → ENSURING → ACTIVE → CLOSING → IDLE;(any) → SHUTTING_DOWN → EXITED
+// CLOSING:browser_close 响应已返回、租约/中继正在释放的过渡窗口。
+// 该窗口内到达的 browser_close 直接返回成功(浏览器确实在关闭),避免走真转发
+// 路径触发 backend 重连 → 挂起连接 → 误"自动重新激活"(旧架构 CLOSE_PENDING 的等价物)。
 const ST = {
-  BOOTING: "BOOTING",
-  READY_IDLE: "READY_IDLE",
-  RESERVING: "RESERVING",
-  STARTING_BROWSER: "STARTING_BROWSER",
-  STARTING_BACKEND: "STARTING_BACKEND",
+  IDLE: "IDLE",
+  ENSURING: "ENSURING",
   ACTIVE: "ACTIVE",
-  CLOSE_PENDING: "CLOSE_PENDING",
-  RELEASING: "RELEASING",
+  CLOSING: "CLOSING",
   SHUTTING_DOWN: "SHUTTING_DOWN",
   EXITED: "EXITED",
 };
 
-let state = ST.BOOTING;
+let state = ST.IDLE;
 let stateLock = Promise.resolve();
 function serialize(fn) {
   const next = stateLock.then(() => fn());
@@ -108,31 +108,23 @@ function setState(newState) {
   state = newState;
 }
 
-// ==================== backend 管理 ====================
-// backend = { child, role, generation }
-// generation 用于 fencing:只有当前 generation 的输出才转发给 ZCode
-let backend = null;
-let backendGeneration = 0;
+// ==================== 本地 TCP 中继(bin/zcode-cdp-relay.js) ====================
+// backend 的 endpoint 永远指向这里;Chrome 起停/端口轮换只改 upstream。
+// 纯字节管道,零解析。无 upstream 时挂起新连接(带超时),attach 后接通;
+// detach 销毁已接通管道(backend 侧 WS 断开,下次调用自动重连)。
+const relay = createRelay({ holdMs: RELAY_HOLD_MS, log });
+
+// ==================== backend(唯一常驻实例) ====================
+let backend = null;      // { child }
 let takeoverChild = null;
-
-// 当前 lease
-let lease = null;       // { port, leaseId }
+let lease = null;        // { port, leaseId }
 let browserPid = null;
-
-// 客户端 initialize 缓存(rearm placeholder 时用于内部握手)
-let cachedClientInit = null;
-
-// activation batch:激活期间到达的请求,exactly-once 入队
-let activationBatch = [];  // [{ line, id }]
-
-// in-flight request tracker:记录已转发的 request id(用于 browser_close 捕获)
-let closeRequestId = null;
+let closeRequestId = null; // 等待中的 browser_close 响应 id
 
 function spawnBackend(endpoint) {
-  backendGeneration++;
-  const gen = backendGeneration;
   const args = [CLI, "--cdp-endpoint", endpoint, "--browser", "chrome", "--isolated"];
   const child = spawn("node", args, { stdio: ["pipe", "pipe", "pipe"] });
+  log(`backend spawn: node ${CLI.split("/").pop()} → ${endpoint}(PID ${child.pid})`);
   // stderr 限流:防 playwright-mcp 刷屏淹没事件循环
   let stderrCount = 0, stderrWindow = Date.now(), stderrSuppressed = 0;
   child.stderr.on("data", d => {
@@ -141,51 +133,21 @@ function spawnBackend(endpoint) {
     process.stderr.write(`[playwright-mcp] ${d}`);
   });
   child.on("error", err => {
-    log(`backend spawn error (gen ${gen}): ${err.message}`);
-    // 如果是当前 backend → 视为 backend 异常退出
-    if (backend && backend.child === child) {
-      onBackendDied(gen, `spawn error: ${err.message}`);
-    }
+    log(`backend spawn error: ${err.message}`);
+    cleanupAndExit(1);
   });
   child.on("exit", (code, sig) => {
-    log(`backend(gen ${gen}) 退出 code=${code} sig=${sig}`);
-    if (backend && backend.child === child) {
-      onBackendDied(gen, `exit code=${code} sig=${sig}`);
-    }
-  });
-  return { child, role: "placeholder", generation: gen };
-}
-
-// backend 异常/正常退出处理
-function onBackendDied(gen, reason) {
-  if (state === ST.SHUTTING_DOWN || state === ST.EXITED) return;
-  if (state === ST.READY_IDLE && backend && backend.generation === gen && backend.role === "placeholder") {
-    // placeholder 退出 → proxy 无法继续应答,退出
-    log(`placeholder backend 退出(reason: ${reason}),proxy 无法继续 → 退出`);
+    // 唯一 backend 死亡 = proxy 失去服务能力(tools/list 也无法应答)→ 退出让 ZCode 重拉
+    log(`backend 退出 code=${code} sig=${sig}(唯一实例,proxy 无法继续服务)`);
     cleanupAndExit(1);
-    return;
-  }
-  if ((state === ST.ACTIVE || state === ST.CLOSE_PENDING) && backend && backend.generation === gen && backend.role === "real") {
-    // real backend 意外退出 → 当前调用失败 → 释放资源 → 回 READY_IDLE
-    log(`real backend 异常退出(reason: ${reason})→ 释放租约,回 READY_IDLE`);
-    serialize(() => handleBackendFailure("real backend exited: " + reason));
-    return;
-  }
-  // 激活期间 backend 退出 → 激活失败
-  if ((state === ST.STARTING_BACKEND) && backend && backend.generation === gen) {
-    log(`backend 启动期间退出(reason: ${reason})→ 释放租约,回 READY_IDLE`);
-    serialize(() => failActivation("backend exited during startup: " + reason));
-    return;
-  }
+  });
+  return { child };
 }
 
-// 把一行 JSON-RPC 写给当前 backend
 function forwardToBackend(line) {
-  if (!backend || !backend.child || !backend.child.stdin.destroyed) {
-    if (!backend || !backend.child || !backend.child.stdin.writable) {
-      log("⚠️ 无可写 backend,丢弃消息:", line.slice(0, 120));
-      return false;
-    }
+  if (!backend || !backend.child || backend.child.stdin.destroyed || !backend.child.stdin.writable) {
+    log("⚠️ 无可写 backend,丢弃消息:", line.slice(0, 120));
+    return false;
   }
   try {
     backend.child.stdin.write(line + "\n");
@@ -197,180 +159,103 @@ function forwardToBackend(line) {
 }
 
 // 从 backend 读 JSON-RPC,按行切分后透传给 ZCode(stdout)
-// generation fencing:只有当前 generation 的输出才转发
-// 含 buf 上限保护(防 O(n²) 增长)+ stdout 行速率限流(防 backend 刷屏淹没事件循环)
+// 含 buf 上限保护(防 O(n²) 增长)+ stdout 行速率限流(超限丢弃本批剩余行并告警;
+// 大 snapshot 是合法场景,不杀 backend —— CPU 异常由三层看门狗兜底)
 function wireBackendOutput(b) {
   let buf = "";
-  const gen = b.generation;
-  let outLines = 0, outWindow = Date.now(), floodTripped = false;
+  let outLines = 0, outWindow = Date.now();
   b.child.stdout.on("data", d => {
-    if (backend !== b) return; // 不是当前 backend,丢弃
     buf += d.toString();
-
-    // buf 上限保护:超 BUF_MAX_BYTES 截断到最后 64KB,防 O(n²) 字符串增长
     if (buf.length > BUF_MAX_BYTES) {
       log(`⚠️ stdout buf 超 ${BUF_MAX_BYTES} bytes,截断到最后 64KB(可能是无换行大数据块)`);
       buf = buf.slice(-65536);
     }
-
     let idx;
     while ((idx = buf.indexOf("\n")) >= 0) {
       const line = buf.slice(0, idx);
       buf = buf.slice(idx + 1);
-
-      // 速率限流:1 秒窗口内超 OUTPUT_RATE_LIMIT 行 → 熔断(只对 real backend 触发)
       if (Date.now() - outWindow >= 1000) { outLines = 0; outWindow = Date.now(); }
       if (++outLines > OUTPUT_RATE_LIMIT) {
-        if (b.role === "real" && !floodTripped) {
-          floodTripped = true;
-          log(`🔥 backend stdout 限流:${outLines} 行/秒 → 杀 real backend,回 READY_IDLE`);
-          serialize(() => handleBackendFailure("backend output flood (> " + OUTPUT_RATE_LIMIT + " lines/s)"));
-        }
-        return; // 本批剩余行全部丢弃
+        log(`⚠️ backend stdout 限流:${outLines} 行/秒,本批剩余行丢弃`);
+        return;
       }
-
-      if (line.trim()) handleBackendLine(line, gen);
+      if (line.trim()) handleBackendLine(line);
     }
   });
 }
 
-// 处理 backend 输出:拦截 synthetic initialize response 和 browser_close response
-function handleBackendLine(line, gen) {
-  // 拦截 synthetic initialize response(用于内部握手)
-  if (syntheticInitPending && gen === backendGeneration) {
-    let msg;
-    try { msg = JSON.parse(line); } catch { process.stdout.write(line + "\n"); return; }
-    if (msg.id === SYNTHETIC_INIT_ID) {
-      syntheticInitPending = false;
-      log("收到 synthetic initialize response → 吞掉,继续握手");
-      onSyntheticInitDone();
-      return;
-    }
-  }
-
-  // 拦截 browser_close response:先转发给 ZCode,再触发 release
+// 处理 backend 输出:拦截 browser_close response(先转发,再触发 teardown)
+function handleBackendLine(line) {
   if (closeRequestId !== null) {
     let msg;
     try { msg = JSON.parse(line); } catch { /* 非 JSON,正常转发 */ }
     if (msg && msg.id === closeRequestId) {
       process.stdout.write(line + "\n");
       closeRequestId = null;
-      serialize(() => releaseAfterClose());
+      serialize(() => teardown());
       return;
     }
   }
-
-  // 正常透传
   process.stdout.write(line + "\n");
 }
 
-// ---- synthetic initialize 协议 ----
-const SYNTHETIC_INIT_ID = "__cdp_proxy_synthetic_init__";
-let syntheticInitPending = false;
-let syntheticInitResolve = null;
+// ==================== ensure / teardown(Chrome 生命周期) ====================
 
-function sendSyntheticInit(b) {
-  syntheticInitPending = true;
-  const initMsg = {
-    jsonrpc: "2.0",
-    id: SYNTHETIC_INIT_ID,
-    method: "initialize",
-    params: cachedClientInit || {
-      protocolVersion: "2024-11-05",
-      capabilities: {},
-      clientInfo: { name: "zcode-cdp-proxy", version: "1.0" },
-    },
-  };
-  b.child.stdin.write(JSON.stringify(initMsg) + "\n");
-  return new Promise(resolve => { syntheticInitResolve = resolve; });
-}
+// 异步确保接管 Chrome 在线:reserve → cdp-takeover → 接通中继 → ACTIVE
+function ensure() {
+  serialize(async () => {
+    if (state !== ST.IDLE) return;
+    if (state === ST.SHUTTING_DOWN || state === ST.EXITED) return;
+    setState(ST.ENSURING);
 
-function onSyntheticInitDone() {
-  // 发送 notifications/initialized
-  if (backend && backend.child && backend.child.stdin.writable) {
-    backend.child.stdin.write(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }) + "\n");
-  }
-  if (syntheticInitResolve) {
-    const r = syntheticInitResolve;
-    syntheticInitResolve = null;
-    r();
-  }
-}
+    // 1. 领端口租约(kind 必须是进程命令行中的子串 → "zcode-cdp-proxy")
+    const r = await L.reserve("zcode-cdp-proxy");
+    if (!r) {
+      log("❌ 端口池已满(7 个会话全在用)");
+      setState(ST.IDLE);
+      relay.failHeld();
+      return;
+    }
+    lease = r;
+    log(`领到端口 ${lease.port}(leaseId ${lease.leaseId.slice(0, 8)})`);
 
-// ==================== 激活流程 ====================
+    if (state === ST.SHUTTING_DOWN || state === ST.EXITED) { await releaseLease(); return; }
 
-// 主激活入口:由 handleClientLine 在首次 browser_ 调用时触发
-function startActivation(firstLine) {
-  if (state !== ST.READY_IDLE) return; // 已经在激活中或不可激活
-  serialize(() => doActivate(firstLine));
-}
+    // 2. 起 Chrome(cdp-takeover managed 模式,幂等 + 重试)
+    const ok = await startChrome(lease.port);
+    if (!ok) {
+      log(`❌ 端口 ${lease.port} 的 Chrome 起不来(见 cdp-takeover 输出)`);
+      await releaseLease();
+      setState(ST.IDLE);
+      relay.failHeld();
+      return;
+    }
+    if (state === ST.SHUTTING_DOWN || state === ST.EXITED) { await releaseLease(); return; }
 
-async function doActivate(firstLine) {
-  if (state === ST.SHUTTING_DOWN || state === ST.EXITED) return;
-  setState(ST.RESERVING);
+    // 3. 记录 browser PID 到 lease + 接通中继
+    const bp = L.portPid(lease.port);
+    browserPid = bp ? parseInt(bp, 10) : null;
+    if (lease) L.markActive(lease.port, lease.leaseId, browserPid);
 
-  // 1. 领端口租约
-  // kind 必须是进程命令行中的子串(zcode-cdp-proxy.js → "zcode-cdp-proxy")
-  const r = await L.reserve("zcode-cdp-proxy");
-  if (!r) {
-    log("❌ 端口池已满(7 个会话全在用)");
-    failActivation("CDP 端口池已满(7 个会话全在用 9223-9229),关掉一个会话或调用 browser_close 释放后再重试");
-    return;
-  }
-  lease = r;
-  log(`领到端口 ${lease.port}(leaseId ${lease.leaseId.slice(0, 8)})`);
-
-  if (state === ST.SHUTTING_DOWN || state === ST.EXITED) { await releaseLease(); return; }
-
-  setState(ST.STARTING_BROWSER);
-
-  // 2. 起 Chrome(cdp-takeover managed 模式)
-  const ok = await startChrome(lease.port);
-  if (!ok) {
-    failActivation(`端口 ${lease.port} 的 Chrome 起不来(见 cdp-takeover 输出)`);
-    return;
-  }
-
-  if (state === ST.SHUTTING_DOWN || state === ST.EXITED) { await releaseLease(); return; }
-
-  // 记录 browser PID 到 lease
-  const bp = L.portPid(lease.port);
-  browserPid = bp ? parseInt(bp, 10) : null;
-  if (lease) L.markActive(lease.port, lease.leaseId, browserPid);
-
-  setState(ST.STARTING_BACKEND);
-
-  // 3. 杀占位 backend → 起真 backend
-  stopBackend();
-
-  const real = spawnBackend(`http://127.0.0.1:${lease.port}`);
-  real.role = "real";
-  backend = real;
-  wireBackendOutput(real);
-
-  // 等待 backend stdout 可写
-  await new Promise(resolve => {
-    if (real.child.stdin.writable) resolve();
-    else real.child.stdin.on("pipe", resolve);
-    setTimeout(resolve, 2000);
+    relay.attach(lease.port);
+    setState(ST.ACTIVE);
+    log(`✅ 激活完成 → 端口 ${lease.port}`);
   });
+}
 
-  if (state === ST.SHUTTING_DOWN || state === ST.EXITED) { await releaseLease(); return; }
-
-  // 4. synthetic initialize 握手
-  log("real backend 启动,执行 synthetic initialize...");
-  await sendSyntheticInit(real);
-
-  if (state === ST.SHUTTING_DOWN || state === ST.EXITED) { await releaseLease(); return; }
-
-  // 5. flush activation batch(exactly-once)
-  setState(ST.ACTIVE);
-  const batch = activationBatch;
-  activationBatch = [];
-  for (const item of batch) {
-    forwardToBackend(item.line);
+// 释放浏览器:断中继、释放租约(内含杀 Agent Chrome)、回 IDLE。
+// teardown 完成时若中继仍有挂起连接(释放期间到达的新请求)→ 自动重新 ensure,
+// 这就是旧架构 activationBatch 重放的等价语义。
+async function teardown() {
+  closeRequestId = null;
+  setState(ST.CLOSING);
+  relay.detach();
+  await releaseLease();
+  setState(ST.IDLE);
+  if (relay.hasHeld()) {
+    log("teardown 完成但中继有挂起连接 → 自动重新激活");
+    ensure();
   }
-  log(`✅ 激活完成 → 端口 ${lease.port},flush ${batch.length} 个排队请求`);
 }
 
 // Chrome 启动:cdp-takeover --managed --lease-id
@@ -380,10 +265,7 @@ async function startChrome(port) {
 
     const code = await new Promise(resolve => {
       const args = [TAKEOVER, String(port)];
-      // managed 模式:让 takeover 核验 lease ownership
-      if (lease) {
-        args.push("--managed", "--lease-id", lease.leaseId);
-      }
+      if (lease) args.push("--managed", "--lease-id", lease.leaseId);
       takeoverChild = spawn("bash", args, { stdio: ["ignore", "pipe", "pipe"] });
       takeoverChild.stdout.on("data", d => process.stderr.write(`[cdp-takeover] ${d}`));
       takeoverChild.stderr.on("data", d => process.stderr.write(`[cdp-takeover] ${d}`));
@@ -418,69 +300,9 @@ async function startChrome(port) {
   return false;
 }
 
-// 激活失败:settle batch(每个 request 返回一次 error)+ 释放 + 回 READY_IDLE
-async function failActivation(reason) {
-  log(`❌ 激活失败: ${reason}`);
-  settleBatch(reason);
-  await releaseLease();
-  setState(ST.READY_IDLE);
-  // placeholder 应该还在,确认它可用
-  if (!backend || backend.role !== "placeholder") {
-    log("激活失败后 placeholder 不在,重启 placeholder");
-    restartPlaceholder();
-  }
-}
-
-// backend 运行中异常:失败当前调用 + 释放 + 回 READY_IDLE
-async function handleBackendFailure(reason) {
-  // 如果有 in-flight request,给它们 error(我们无法精确知道哪个,但 real backend 死了 → 所有 pending 都失败)
-  settleBatch(reason);
-
-  // 如果有 closeRequestId 也在等 → 取消
-  closeRequestId = null;
-
-  await releaseLease();
-  setState(ST.READY_IDLE);
-  restartPlaceholder();
-}
-
-// settle batch:对本轮 activationBatch 中每个有 id 的 request 返回一次 error,然后清空
-function settleBatch(reason) {
-  for (const item of activationBatch) {
-    if (item.id !== undefined && item.id !== null) {
-      const err = JSON.stringify({
-        jsonrpc: "2.0",
-        id: item.id,
-        error: { code: -32603, message: reason },
-      });
-      process.stdout.write(err + "\n");
-    }
-  }
-  activationBatch = [];
-}
-
-// browser_close 完成后释放整份租约,重启 placeholder
-async function releaseAfterClose() {
-  setState(ST.RELEASING);
-  log("browser_close 响应已返回 → 释放整份租约");
-
-  stopBackend();
-  await releaseLease();
-  setState(ST.READY_IDLE);
-  restartPlaceholder();
-  // 重放释放期间缓冲的请求(否则会悬挂到下一次激活才被 flush):
-  // 非 browser_ 请求透传给新 placeholder;browser_ 请求按 READY_IDLE 语义重新处理
-  // (browser_close 直接成功,browser_* 触发新一轮激活)。
-  const batch = activationBatch;
-  activationBatch = [];
-  for (const item of batch) handleClientLine(item.line);
-  log("已回到 READY_IDLE,等待下次 browser_ 调用");
-}
-
-// 释放当前 lease(杀 Chrome + 删锁)
+// 释放当前 lease(杀 Agent Chrome + 删锁,核对 leaseId)
 async function releaseLease() {
   stopTakeoverChild();
-  stopBackend();
   if (lease) {
     await L.release(lease.port, lease.leaseId);
     log(`释放端口 ${lease.port}`);
@@ -489,7 +311,6 @@ async function releaseLease() {
   }
 }
 
-// 停止 takeover child
 function stopTakeoverChild() {
   if (takeoverChild) {
     try { takeoverChild.kill("SIGTERM"); } catch {}
@@ -497,47 +318,21 @@ function stopTakeoverChild() {
   }
 }
 
-// 停止当前 backend(不杀 placeholder,只杀 real;切换时用)
-function stopBackend() {
-  if (backend && backend.child) {
-    backend.child.removeAllListeners("exit");
-    backend.child.removeAllListeners("error");
-    try { backend.child.kill("SIGTERM"); } catch {}
-    backend = null;
-  }
-}
-
-// 重启 placeholder backend(回 READY_IDLE 时用)
-function restartPlaceholder() {
-  stopBackend();
-  const ph = spawnBackend(PLACEHOLDER_ENDPOINT);
-  ph.role = "placeholder";
-  backend = ph;
-  wireBackendOutput(ph);
-  // rearm 握手:placeholder 是全新进程,而 ZCode 只在连接建立时发一次 initialize,
-  // 不会重发。不握手的话,close 之后透传进来的 tools/list 等非浏览器请求会因
-  // backend 未初始化而悬挂/报错(响应被 handleBackendLine 的 synthetic 拦截吞掉)。
-  if (cachedClientInit) sendSyntheticInit(ph).catch(() => {});
-  log("placeholder backend 重启就绪");
-}
-
-// ---- 健康检查(ACTIVE 状态,检测 Chrome/backend 死亡,非 idle timeout) ----
+// ---- 健康检查(ACTIVE 状态,检测 Chrome 死亡/被替换;非 idle timeout) ----
 let healthCheckTimer = null;
 function startHealthCheck() {
   stopHealthCheck();
   healthCheckTimer = setInterval(() => {
-    if (state !== ST.ACTIVE) return;
-    if (!lease) return;
+    if (state !== ST.ACTIVE || !lease) return;
     serialize(async () => {
-      if (state !== ST.ACTIVE) return;
+      if (state !== ST.ACTIVE || !lease) return;
       const listener = L.portPid(lease.port);
       if (!listener) {
-        log(`⚠️ Chrome 在端口 ${lease.port} 上消失(listener gone)`);
-        await handleBackendFailure("Chrome listener disappeared");
+        log(`⚠️ Chrome 在端口 ${lease.port} 上消失(listener gone)→ 回 IDLE`);
+        await teardown();
       } else if (!L.isAgentChromePid(listener)) {
-        log(`⚠️ 端口 ${lease.port} 的 listener 变成非 Agent Chrome`);
-        // 不杀非 Agent;释放 lease 让 proxy 回 idle
-        await handleBackendFailure("port listener is no longer Agent Chrome");
+        log(`⚠️ 端口 ${lease.port} 的 listener 变成非 Agent Chrome → 释放租约回 IDLE(不杀非 Agent)`);
+        await teardown();
       }
     });
   }, HEALTH_CHECK_INTERVAL_MS);
@@ -549,7 +344,7 @@ function stopHealthCheck() {
 // ==================== CPU 看门狗 + 孤儿超时 ====================
 // 看门狗:setInterval(1000) 实测回调间隔,连续 WATCHDOG_TRIES 次延迟 > WATCHDOG_LAG_MS
 //          → 说明事件循环被淹没(正是 99% CPU 的症状)→ 自杀退出(ZCode 自动重拉新实例)
-// 孤儿超时:stdin 超过 ORPHAN_TIMEOUT_MS 无数据 → 判定为孤儿 proxy,退出
+// 孤儿超时:超过 ORPHAN_TIMEOUT_MS 无真实 MCP 业务请求 → 判定为孤儿 proxy,退出
 let watchdogTimer = null;
 let orphanTimer = null;
 // 业务活动时间戳:只有真实 MCP 业务请求(initialize/tools/list 等)才刷新。
@@ -765,95 +560,44 @@ process.stdin.on("close", () => {
   cleanupAndExit(0);
 });
 
+// 请求观察者:所有消息照常透传,仅观察 browser_* 触发生命周期。
+// ensure 期间到达的请求不缓冲 —— 中继挂起语义保证它在 Chrome 就绪后自然流动。
 function handleClientLine(line) {
   if (!line.trim()) return;
-  let msg;
+  let msg = null;
   try { msg = JSON.parse(line); } catch { log("⚠️ 非 JSON,丢弃:", line.slice(0, 120)); return; }
 
-  // 业务活动度心跳:真实 MCP 业务方法才刷新 lastBusinessTime(用于 orphan 检测)。
-  // 区别于 lastStdinTime(任何 stdin 字节都刷新,会被 keepalive 噪声绕过孤儿超时)。
-  if (msg.method && BUSINESS_METHODS.test(msg.method)) {
+  // 业务活动度心跳:真实 MCP 业务方法才刷新 lastBusinessTime(用于 orphan 检测)
+  if (msg && msg.method && BUSINESS_METHODS.test(msg.method)) {
     lastBusinessTime = Date.now();
   }
 
-  // 缓存客户端 initialize 参数(rearm placeholder 时用)
-  if (msg.method === "initialize" && msg.params) {
-    cachedClientInit = msg.params;
-  }
-
-  const isBrowserCall = msg.method === "tools/call" && msg.params && typeof msg.params.name === "string" && msg.params.name.startsWith("browser_");
+  const isBrowserCall = !!(msg && msg.method === "tools/call" && msg.params && typeof msg.params.name === "string" && msg.params.name.startsWith("browser_"));
   const isBrowserClose = isBrowserCall && msg.params.name === "browser_close";
 
-  // ---- 状态分发 ----
-  switch (state) {
-    case ST.READY_IDLE:
-      if (isBrowserClose) {
-        // dormant 状态收到 browser_close:直接返回成功(已释放),不启动 Chrome
-        log("READY_IDLE 收到 browser_close → 直接返回成功(无需启动 Chrome)");
-        if (msg.id !== undefined) {
-          process.stdout.write(JSON.stringify({
-            jsonrpc: "2.0",
-            id: msg.id,
-            result: { content: [{ type: "text", text: "Browser already closed (no active CDP session)." }] },
-          }) + "\n");
-        }
-        return;
-      }
-      if (isBrowserCall) {
-        // 首次 browser_ 调用 → 触发激活(exactly-once enqueue)
-        activationBatch.push({ line, id: msg.id !== undefined ? msg.id : null });
-        startActivation(line);
-        return;
-      }
-      // 非浏览器调用:透传给 placeholder
-      forwardToBackend(line);
-      return;
-
-    case ST.RESERVING:
-    case ST.STARTING_BROWSER:
-    case ST.STARTING_BACKEND:
-      // 激活期间:所有消息 exactly-once 入队(包括 browser_ 和非 browser_)
-      // 检查是否已在 batch 中(防重复)
-      if (!activationBatch.some(item => item.line === line)) {
-        activationBatch.push({ line, id: msg.id !== undefined ? msg.id : null });
-      }
-      return;
-
-    case ST.ACTIVE:
-      if (isBrowserClose) {
-        // browser_close:转发,但记录 request id 用于捕获响应
-        closeRequestId = msg.id !== undefined ? msg.id : null;
-        forwardToBackend(line);
-        setState(ST.CLOSE_PENDING);
-        return;
-      }
-      // 正常透传
-      forwardToBackend(line);
-      return;
-
-    case ST.CLOSE_PENDING:
-      // close 执行期间到达的新请求:缓冲,待 rearm 后作为新 activation 处理
-      // 不能发给正在 dispose 的 backend
-      if (!activationBatch.some(item => item.line === line)) {
-        activationBatch.push({ line, id: msg.id !== undefined ? msg.id : null });
-      }
-      return;
-
-    case ST.RELEASING:
-      // 正在释放:缓冲
-      if (!activationBatch.some(item => item.line === line)) {
-        activationBatch.push({ line, id: msg.id !== undefined ? msg.id : null });
-      }
-      return;
-
-    case ST.SHUTTING_DOWN:
-    case ST.EXITED:
-      // 退出中:丢弃(settle 会处理 pending)
-      return;
-
-    default:
-      forwardToBackend(line);
+  if (isBrowserClose && (state === ST.IDLE || state === ST.CLOSING)) {
+    // dormant/关闭中 收到 browser_close:直接返回成功(已释放或正在释放),不启动 Chrome
+    log("IDLE/CLOSING 收到 browser_close → 直接返回成功(无需启动 Chrome)");
+    if (msg.id !== undefined) {
+      process.stdout.write(JSON.stringify({
+        jsonrpc: "2.0",
+        id: msg.id,
+        result: { content: [{ type: "text", text: "Browser already closed (no active CDP session)." }] },
+      }) + "\n");
+    }
+    return;
   }
+  if (isBrowserCall && !isBrowserClose && state === ST.IDLE) {
+    // 首次 browser_ 调用 → 异步 ensure;请求照常转发(backend 连中继挂起,ensure 完成后流动)
+    log("IDLE 收到 browser_* → 触发 ensure(异步)");
+    ensure();
+  }
+  if (isBrowserClose && (state === ST.ACTIVE || state === ST.ENSURING)) {
+    // browser_close:转发,记录请求 id 用于捕获响应后 teardown
+    closeRequestId = msg.id !== undefined ? msg.id : null;
+  }
+
+  forwardToBackend(line);
 }
 
 // ==================== 启动期去重:同父进程下已有更早 proxy 实例 → 自己退出 ====================
@@ -918,11 +662,11 @@ async function cleanupAndExit(code) {
   stopHardWatchdog(); // 停硬看门狗(正常退出时不需要它再杀自己)
 
   try {
-    // settle pending batch
-    settleBatch("proxy shutting down");
-
     // 停 takeover child
     stopTakeoverChild();
+
+    // 断中继管道
+    relay.stop();
 
     // 停 backend
     if (backend && backend.child) {
@@ -967,7 +711,7 @@ process.on("exit", () => {
 
 // ==================== 启动 ====================
 (async () => {
-  log("启动 lazy CDP proxy(占位 backend,READY_IDLE = 0 端口 0 Chrome)");
+  log("启动 lazy CDP proxy(本地中继架构,IDLE = 0 端口 0 Chrome)");
 
   // 启动期回收孤儿
   const reaped = await L.reap();
@@ -987,15 +731,16 @@ process.on("exit", () => {
     }
   }
 
-  // 启动占位 backend
-  const ph = spawnBackend(PLACEHOLDER_ENDPOINT);
-  ph.role = "placeholder";
-  backend = ph;
-  wireBackendOutput(ph);
+  // 开中继(随机端口)→ spawn 唯一常驻 backend(endpoint=中继)
+  const relayPort = await relay.start();
+  log(`中继监听 127.0.0.1:${relayPort}(无 upstream 时挂起,上限 ${RELAY_HOLD_MS}ms)`);
 
-  setState(ST.READY_IDLE);
+  backend = spawnBackend(`http://127.0.0.1:${relayPort}`);
+  wireBackendOutput(backend);
+
+  setState(ST.IDLE);
   startHealthCheck();
   startWatchdog();
   startHardWatchdog(); // 硬看门狗:worker 线程,免疫主线程 busy-loop
-  log("占位 backend 就绪,READY_IDLE,等待首个 browser_ 调用才激活");
+  log(`backend 常驻就绪(PID ${backend.child.pid}),IDLE,等待首个 browser_ 调用才激活`);
 })();
