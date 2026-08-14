@@ -28,6 +28,9 @@
   "engines": {
     "node": ">=18"
   },
+  "scripts": {
+    "test": "bash test/backtest.sh"
+  },
   "dependencies": {
     "@playwright/mcp": "^0.0.30"
   },

@@ -128,7 +128,10 @@ do_status() {
   printf "%-7s %-6s %-8s %-7s %s\n" "端口" "状态" "PID" "用途" "说明"
   local lease_root="${CDP_LOCK_ROOT:-/tmp/zcode-cdp/ports}"
   for p in "${ALL_PORTS[@]}"; do
-    local pid owner note lease_pid lease_state; pid=$(port_pid "$p"); owner=$(port_meta "$p"); owner="${owner%%|*}"
+    local pid owner note lease_pid lease_state
+    pid=$(port_pid "$p"); owner=$(port_meta "$p"); owner="${owner%%|*}"
+    # 每轮重置:lease_* 只在有锁时赋值,残留上轮的值会把无锁端口误显示成"占位"
+    lease_pid=""; lease_state=""
     if [ "${owner}" = "session" ]; then note="会话临时池"; elif [ "${owner}" = "scripts" ]; then note="脚本固定端口"; else note="-"; fi
     # 新 lease(zcode-cdp-lease)状态
     if [ -f "$lease_root/$p.lock/owner.json" ]; then

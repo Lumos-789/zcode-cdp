@@ -128,9 +128,6 @@ let activationBatch = [];  // [{ line, id }]
 // in-flight request tracker:记录已转发的 request id(用于 browser_close 捕获)
 let closeRequestId = null;
 
-// placeholder 是否已对客户端完成 initialize 应答
-let placeholderInitialized = false;
-
 function spawnBackend(endpoint) {
   backendGeneration++;
   const gen = backendGeneration;
@@ -471,6 +468,12 @@ async function releaseAfterClose() {
   await releaseLease();
   setState(ST.READY_IDLE);
   restartPlaceholder();
+  // 重放释放期间缓冲的请求(否则会悬挂到下一次激活才被 flush):
+  // 非 browser_ 请求透传给新 placeholder;browser_ 请求按 READY_IDLE 语义重新处理
+  // (browser_close 直接成功,browser_* 触发新一轮激活)。
+  const batch = activationBatch;
+  activationBatch = [];
+  for (const item of batch) handleClientLine(item.line);
   log("已回到 READY_IDLE,等待下次 browser_ 调用");
 }
 
@@ -511,7 +514,10 @@ function restartPlaceholder() {
   ph.role = "placeholder";
   backend = ph;
   wireBackendOutput(ph);
-  placeholderInitialized = false;
+  // rearm 握手:placeholder 是全新进程,而 ZCode 只在连接建立时发一次 initialize,
+  // 不会重发。不握手的话,close 之后透传进来的 tools/list 等非浏览器请求会因
+  // backend 未初始化而悬挂/报错(响应被 handleBackendLine 的 synthetic 拦截吞掉)。
+  if (cachedClientInit) sendSyntheticInit(ph).catch(() => {});
   log("placeholder backend 重启就绪");
 }
 
@@ -546,9 +552,8 @@ function stopHealthCheck() {
 // 孤儿超时:stdin 超过 ORPHAN_TIMEOUT_MS 无数据 → 判定为孤儿 proxy,退出
 let watchdogTimer = null;
 let orphanTimer = null;
-let lastStdinTime = Date.now();
 // 业务活动时间戳:只有真实 MCP 业务请求(initialize/tools/list 等)才刷新。
-// orphan 判定改用此字段,而非 lastStdinTime —— 后者会被 zcode-cli 的 keepalive/
+// orphan 判定用此字段而非 stdin 心跳 —— 后者会被 zcode-cli 的 keepalive/
 // progress 类 stdin 噪声刷新,导致孤儿超时永不触发(实测:30min 内只要有 1 字节 stdin
 // 数据,孤儿就逃过)。用业务活动度作为"还活着"的证据,30min 无真实请求即判孤儿退出。
 let lastBusinessTime = Date.now();
@@ -715,7 +720,7 @@ function startWatchdog() {
 
   orphanTimer = setInterval(() => {
     // 用业务活动度(lastBusinessTime)而非 stdin 心跳:zcode-cli 周期发的 keepalive/
-    // progress 噪声会刷新 lastStdinTime 让孤儿检测失效;只有真实 MCP 请求才证明
+    // progress 噪声会刷新 stdin 活动让孤儿检测失效;只有真实 MCP 请求才证明
     // 本 proxy 还在被使用,30min 无真实业务 = 孤儿(被 zcode-cli spawn 后遗忘)
     if (Date.now() - lastBusinessTime > ORPHAN_TIMEOUT_MS) {
       log(`(${Math.round(ORPHAN_TIMEOUT_MS / 60000)}min 无真实 MCP 业务请求 → 判定为孤儿 proxy(被 zcode-cli 遗忘),退出)`);
@@ -733,7 +738,6 @@ let inBuf = "";
 process.stdin.setEncoding("utf8");
 
 process.stdin.on("data", chunk => {
-  lastStdinTime = Date.now();
   beatHeartbeat(); // stdin 收到数据 → 刷新硬看门狗心跳
   inBuf += chunk;
 

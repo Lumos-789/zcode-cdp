@@ -34,3 +34,6 @@ chrome-takeover-*/
 # Test artifacts
 coverage/
 .nyc_output/
+
+# ZCode 本地工作区（wiki/plans/scripts/tmp），永不提交
+.zcode/

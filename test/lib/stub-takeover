@@ -1,0 +1,37 @@
+#!/bin/bash
+# stub-takeover — 假 cdp-takeover(仅测试用)
+# 行为契约:在指定端口起一个常驻 tcp listener,让 proxy 的 lsof 探活通过;
+# 幂等(已监听直接 exit 0)。listener 进程与脚本分离,由测试 teardown 负责清理。
+# listener 故意不含 "chrome-takeover" 命令行 → lease 的 killAgentChrome 不会杀它
+# (非 Agent 永不杀),测试环境自清理。
+#
+# 用法: stub-takeover <port> [--managed --lease-id <id>](多余参数忽略)
+
+set -euo pipefail
+
+PORT="${1:?stub-takeover: missing port}"
+ART_DIR="${CDP_TEST_ARTIFACT_DIR:-/tmp/zcode-cdp-test}"
+mkdir -p "$ART_DIR"
+
+if lsof -iTCP:"$PORT" -sTCP:LISTEN -P -n -t >/dev/null 2>&1; then
+  echo "stub-takeover: port $PORT already listening (idempotent ok)"
+  exit 0
+fi
+
+PID_FILE="$ART_DIR/listener-$PORT.pid"
+# listener 脚本文件名含 "chrome-takeover"(见该文件头注释):lease 的 killAgentChrome
+# 会认它是 Agent Chrome 并在 release 时杀掉,与生产 Chrome 生命周期语义一致。
+nohup node "$(dirname "$0")/chrome-takeover-stub-listener.js" "$PORT" \
+  >/dev/null 2>&1 &
+echo $! > "$PID_FILE"
+
+# 等监听就绪(与真 cdp-takeover 的 15s 轮询对齐,stub 通常 <1s)
+for _ in $(seq 1 15); do
+  if lsof -iTCP:"$PORT" -sTCP:LISTEN -P -n >/dev/null 2>&1; then
+    echo "stub-takeover: listening on $PORT (pid $(cat "$PID_FILE"))"
+    exit 0
+  fi
+  sleep 1
+done
+echo "stub-takeover: port $PORT never came up" >&2
+exit 1

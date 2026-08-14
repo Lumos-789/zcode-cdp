@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **标准回测(回归验证)体系** — `npm test` 一键跑三层,零真实 Chrome 副作用(详见 `docs/backtest.md`)
+  - **L0 静态自检**(`test/backtest.sh`):语法 + 契约 marker(`chrome-takeover` 运行时 marker、9223-9229 端口池、默认锁路径、bin 四入口)
+  - **L1 租约单元**(`test/lease.test.js`):reserve → check → mark-active → release → re-reserve 生命周期 + stale/zombie 异常锁判定与回收 + leaseId 归属校验
+  - **L2 状态机端到端**(`test/proxy.test.js`):stub 化 backend/takeover,覆盖 激活 → close → rearm → 再激活 → SIGTERM 清理 全链路
+  - stub listener 文件名故意含 `chrome-takeover`,使 release 链路按真 Chrome 语义回收租约
+
+### Fixed
+- **proxy: `browser_close` 后 placeholder 未重新握手** — `restartPlaceholder()` 起的新占位 backend 是全新进程,而客户端只在连接建立时发一次 `initialize`;旧版 close 之后透传的 `tools/list` 等非浏览器请求会因 backend 未初始化而悬挂。现在 rearm 时用缓存的客户端参数补 synthetic initialize(回归用例:`proxy.test.js` 回归#1)
+- **proxy: 释放期间到达的请求悬挂** — `CLOSE_PENDING`/`RELEASING` 缓冲的请求原先要等下一次激活才被 flush;现在 `releaseAfterClose()` 回 READY_IDLE 后立即重放(非 `browser_` 透传给新 placeholder,`browser_` 按 READY_IDLE 语义重新处理)(回归用例:回归#2)
+- **cdp-takeover: `status` 循环变量残留** — `lease_pid`/`lease_state` 跨迭代不清空,单个活跃租约会把其后所有无锁端口误显示成"占位 lease=active"。每轮重置修复
+- **cdpcc: 端口数量文案** — 注释/报错写"六个端口开不了第 7 个",实际池为 9223-9229 七个
+- **lease: CLI 文档与实现不一致** — 头注释的 `reserve [--kind <kind>]` 改为实际位置参数 `reserve [kind] [preferredPort]`;CLI 默认 kind 统一为 `zcode-cdp-proxy`(与 proxy 实际传值一致)
+
+### Changed
+- proxy 清理只写不读的死代码(`placeholderInitialized`、`lastStdinTime`)
+
 ## [0.1.0] — 2026-08-02
 
 ### 🎉 First public release

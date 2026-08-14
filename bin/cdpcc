@@ -9,7 +9,7 @@
 # 端口预占:通过统一 lease manager(zcode-cdp-lease.js)领取端口租约,
 # 与 zcode-cdp-proxy 共享同一原子锁命名空间,消除双 owner 竞态。
 #
-# 多个 cdpcc 窗口自动分到不同端口(9223/9224/9225/9227/9228/9229),互不冲突;工具统一 mcp__cdp__*。
+# 多个 cdpcc 窗口自动分到不同端口(9223-9229 临时池),互不冲突;工具统一 mcp__cdp__*。
 #
 # 用法:
 #   cdpcc                       自动选空闲端口,启带 cdp 工具的 CC(Chrome 懒起)
@@ -54,7 +54,7 @@ node "$LEASE" reap >&2
 
 # 1. 通过统一 lease manager 领取端口租约(kind="cdpcc")
 RESERVE_OUT=$(node "$LEASE" reserve cdpcc 2>&1) || {
-  echo "❌ 六个端口(9223/9224/9225/9227/9228/9229)都被占着,开不了第 7 个。" >&2
+  echo "❌ 七个临时端口(9223-9229)都被占着,开不了第 8 个。" >&2
   echo "" >&2; "$TAKEOVER" status >&2; echo "" >&2
   echo "提示:关掉一个 cdpcc 窗口即可(退出时自动释放端口和 Chrome)。" >&2
   exit 1

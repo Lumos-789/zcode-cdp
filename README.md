@@ -285,6 +285,7 @@ with sync_playwright() as p:
 | [`docs/profile-management.md`](./docs/profile-management.md) | **Profile 管理** —— `rsync` 继承登录态、`--refresh`、每端口头像、多账号隔离 |
 | [`docs/troubleshooting.md`](./docs/troubleshooting.md) | **排查清单** —— 端口被占 / Chrome 不起 / 工具不出现 / stale 锁 等常见问题 |
 | [`docs/platform-notes.md`](./docs/platform-notes.md) | **反爬与编辑器踩坑** —— CDP 三禁令、拟人滚动、Draft.js 注入、风控信号识别 |
+| [`docs/backtest.md`](./docs/backtest.md) | **标准回测流程** —— L0 静态 / L1 租约 / L2 状态机三层回归,改代码后 `npm test` 一键跑,零真实 Chrome 副作用 |
 
 CHANGELOG 见 [`CHANGELOG.md`](./CHANGELOG.md)，bug 上报模板见 [`.github/ISSUE_TEMPLATE/bug-report.md`](./.github/ISSUE_TEMPLATE/bug-report.md)。
 

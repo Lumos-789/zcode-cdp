@@ -18,7 +18,7 @@
 //   /tmp/cdpcc-port-<port>.lock/pid       (旧 cdpcc)
 //
 // CLI 用法:
-//   node zcode-cdp-lease.js reserve [--kind <kind>] [--port <port>]
+//   node zcode-cdp-lease.js reserve [kind] [preferredPort]
 //     → JSON: {port, leaseId} 或 {error: ...}
 //   node zcode-cdp-lease.js release <port> <leaseId>
 //     → JSON: {ok: true} 或 {error: ...}
@@ -396,7 +396,8 @@ if (require.main === module) {
   (async () => {
     switch (cmd) {
       case "reserve": {
-        const kind = process.argv[3] || "zcode-proxy";
+        // kind 需是 owner 进程命令行的子串(ownerPidValid 用它做 marker 校验)
+        const kind = process.argv[3] || "zcode-cdp-proxy";
         const portArg = process.argv[4];
         const preferred = portArg ? parseInt(portArg, 10) : null;
         const r = await reserve(kind, preferred);
