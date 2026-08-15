@@ -70,6 +70,9 @@ This means:
 ### Per-port Chrome avatars
 `cdp-takeover` assigns each port a different Chrome built-in avatar (the cartoon icons in Chrome's profile picker) so you can visually tell which window is which port at a glance. The avatar index is baked into the `port_meta()` table in `bin/cdp-takeover`.
 
+### Extension toolbar pin sync
+Chrome resets `extensions.pinned_extensions` on first run / evolution in a copied user-data-dir (observed: port 9224 dropped from 4 pinned icons to 1), which makes the takeover window look "extension-less" — icons get tucked into the puzzle menu. On every boot, `cdp-takeover` restores the pinned-extension list from your everyday profile's `Preferences` before launching Chrome, so the takeover toolbar matches what you're used to. Verified: pin state survives Chrome's runtime (no re-reset).
+
 ---
 
 ## 5. Setting the source profile path

@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **cdp-takeover: 扩展工具栏 pin 状态同步** — Chrome 在拷贝的 user-data-dir 中会重置
+  `extensions.pinned_extensions`(实测 9224 从 4 个掉到 1 个),接管窗口的工具栏因此
+  "看不到插件"(图标被收进拼图菜单)。现在每次启动接管 Chrome 前从日常 profile 恢复
+  pin 列表;实测 Chrome 运行期不再重置。
+
 ## [0.2.0] — 2026-08-15
 
 ### 🏗️ Changed — relay 架构重写(OpenSpec 规格:`openspec/changes/relay-architecture/`)

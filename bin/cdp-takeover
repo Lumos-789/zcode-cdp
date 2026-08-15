@@ -226,14 +226,13 @@ else
   rsync_profile
 fi
 
-# 打标记：profile 头像（python 段）
-echo "设置 agent 头像（端口 ${TARGET_PORT}）..."
-PORT="${TARGET_PORT}" PROFILE_DST="$PROFILE_DST" AVATAR_IDX="$AVATAR_IDX" \
+# 打标记：profile 头像 + 同步扩展工具栏 pin（python 段）
+echo "设置 agent 头像 + 同步扩展 pin（端口 ${TARGET_PORT}）..."
+PORT="${TARGET_PORT}" PROFILE_SRC="$PROFILE_SRC" PROFILE_DST="$PROFILE_DST" AVATAR_IDX="$AVATAR_IDX" \
 python3 << 'PYEOF'
 import json, os, sys
 
 PROFILE_DST = os.environ["PROFILE_DST"]
-avatar_idx = int(os.environ["AVATAR_IDX"])
 
 # Preferences：profile avatar
 prefs_path = os.path.join(PROFILE_DST, "Default", "Preferences")
@@ -242,7 +241,22 @@ if not os.path.exists(prefs_path):
 with open(prefs_path) as f:
     prefs = json.load(f)
 prefs.setdefault("profile", {})
-prefs["profile"]["avatar_index"] = avatar_idx
+prefs["profile"]["avatar_index"] = int(os.environ["AVATAR_IDX"])
+
+# 同步扩展工具栏 pin 状态：Chrome 在新 user-data-dir 首启/演化中会重置
+# pinned_extensions（实测 9224 从 4 个掉到 1 个），每次启动前从源 profile 恢复，
+# 让接管窗口的工具栏与用户日常 Chrome 一致（扩展图标不被收进拼图菜单）。
+src_prefs_path = os.path.join(os.environ["PROFILE_SRC"], "Default", "Preferences")
+try:
+    with open(src_prefs_path) as f:
+        src_pinned = json.load(f).get("extensions", {}).get("pinned_extensions")
+except FileNotFoundError:
+    src_pinned = None
+if isinstance(src_pinned, list):
+    prefs.setdefault("extensions", {})
+    if prefs["extensions"].get("pinned_extensions") != src_pinned:
+        prefs["extensions"]["pinned_extensions"] = src_pinned
+        print(f"✅ toolbar pin: 恢复 {len(src_pinned)} 个扩展图标固定")
 with open(prefs_path, "w") as f:
     json.dump(prefs, f)
 
@@ -253,10 +267,10 @@ if os.path.exists(local_state_path):
         ls = json.load(f)
     info = ls.setdefault("profile", {}).setdefault("info_cache", {}).setdefault("Default", {})
     info["is_using_default_avatar"] = False
-    info["avatar_icon"] = f"chrome://theme/IDR_PROFILE_AVATAR_{avatar_idx}"
+    info["avatar_icon"] = f"chrome://theme/IDR_PROFILE_AVATAR_{os.environ['AVATAR_IDX']}"
     with open(local_state_path, "w") as f:
         json.dump(ls, f)
-    print(f"✅ Local State: avatar={avatar_idx}")
+    print(f"✅ Local State: avatar={os.environ['AVATAR_IDX']}")
 PYEOF
 
 # 启动 Agent Chrome（外接左屏，多窗口 Y 错开层叠）
