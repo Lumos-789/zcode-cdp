@@ -35,5 +35,8 @@ chrome-takeover-*/
 coverage/
 .nyc_output/
 
+# playwright-mcp 运行时缓存目录
+.playwright-mcp/
+
 # ZCode 本地工作区（wiki/plans/scripts/tmp），永不提交
 .zcode/
