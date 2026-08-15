@@ -40,3 +40,6 @@ coverage/
 
 # ZCode 本地工作区（wiki/plans/scripts/tmp），永不提交
 .zcode/
+
+# OpenSpec 规格工作流（本地开发过程产物，不随开源分发）
+openspec/

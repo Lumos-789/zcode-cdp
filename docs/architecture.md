@@ -113,7 +113,7 @@ proxy 是一个**请求观察者**：所有 client→backend 消息照常透传�
 > **架构演进注**：v0.1.x 采用 placeholder/real 双 backend 切换 + synthetic
 > initialize + activation batch + generation fencing 四件套（9 状态）。v0.2.0
 > 起实测 playwright-mcp 的 `browser_close` 后可完全复用，遂改为"本地 TCP 中继 +
-> 单常驻 backend"，四件套整体删除（变更规格见 `openspec/`，回归验证见
+> 单常驻 backend"，四件套整体删除（回归验证见
 > `docs/backtest.md`）。下文描述当前架构。
 
 ### 状态定义
@@ -396,4 +396,4 @@ proxy 是长驻进程，最大的事故风险是**主线程 busy-loop（99% CPU 
 | `bin/cdp-takeover` | ~280 | Chrome 启动器（durable / managed 双模式 + profile rsync） |
 | `bin/cdpcc` | ~100 | Claude Code 启动 wrapper（注入 cdp MCP 配置 + 预占端口） |
 
-详细看门狗事故复盘见 `docs/watchdog-postmortem.md`；变更规格与验收见 `openspec/` 与 `docs/backtest.md`。
+详细看门狗事故复盘见 `docs/watchdog-postmortem.md`；回归验收见 `docs/backtest.md`。

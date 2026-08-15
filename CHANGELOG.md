@@ -15,7 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.2.0] — 2026-08-15
 
-### 🏗️ Changed — relay 架构重写(OpenSpec 规格:`openspec/changes/relay-architecture/`)
+### 🏗️ Changed — relay 架构重写
 
 **核心:删除 placeholder/real 双 backend 切换,改为"本地 TCP 中继 + 单常驻 backend"。**
 依据:实测 playwright-mcp 单实例在 `browser_close` 后可完全复用(再次 navigate 自动
