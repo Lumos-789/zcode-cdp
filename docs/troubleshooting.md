@@ -158,6 +158,23 @@ See [`watchdog-postmortem.md`](watchdog-postmortem.md) for the full story.
 
 ---
 
+### Browser opens an empty window first, then a second window for the actual page
+
+> **2026-09-01 root cause** (fixed in fc03f38): two stacked issues.
+
+**Symptom**: on lazy start, the takeover Chrome shows a blank NTP window first, then a second window opens with the target page. One redundant blank window every time (sometimes manifesting as two tabs).
+
+**Cause (two layers, both required to fix)**:
+
+1. **`zcode-cdp-proxy.js` passed `--isolated` to playwright-mcp.** With `--cdp-endpoint`, that flag makes the backend create its own isolated BrowserContext (`Target.createBrowserContext` + `Target.createTarget` in it — captured via `DEBUG=pw:protocol`), so it **never claims the startup NTP tab**; the first `browser_navigate` always opens a new window. The takeover Chrome already runs a dedicated profile per port — the isolation is pointless. Fix: drop the flag; the backend then uses the default context and claims the startup tab.
+2. **The DevTools port listens before the startup tab exists** (race). `cdp-takeover` used to return as soon as the port listened, so the backend could connect while `pages()` was still empty → `ensureTab()` still created an extra tab. Fix: after the port listens, poll `/json/list` until a `type=page` target appears (≤10s, fail-open) before reporting ready.
+
+**How this was pinned down** (reusable technique): reproduce via the full proxy chain, then re-run with `DEBUG=pw:protocol` inherited by the backend and grep `Target.attachedToTarget` / `Target.createBrowserContext` — the NTP attaching in the default context while the backend's page lands in a *different* context id is the smoking gun.
+
+**Lesson**: for flags that configure page/context ownership on an attached browser (`--isolated`, `--extension`, viewport options), verify against the CDP target graph, not just "it connects and navigates".
+
+---
+
 ### Lease survives the agent that created it
 
 **Symptom**: a port shows "occupied" forever, even after you've quit the agent.
