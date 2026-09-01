@@ -286,12 +286,30 @@ nohup /Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome \
 
 # 等端口就绪
 echo "等待 DevTools 就绪（端口 ${TARGET_PORT}）..."
+ready=0
 for i in $(seq 1 15); do
-  if lsof -iTCP:"${TARGET_PORT}" -sTCP:LISTEN -P -n >/dev/null 2>&1; then
-    echo "✅ Agent Chrome 就绪 — 端口 ${TARGET_PORT}（${OWNER}）"
-    exit 0
-  fi
+  if lsof -iTCP:"${TARGET_PORT}" -sTCP:LISTEN -P -n >/dev/null 2>&1; then ready=1; break; fi
   sleep 1
 done
-echo "❌ 端口 ${TARGET_PORT} 15s 后仍未监听，启动失败" >&2
-exit 1
+if [ "$ready" != "1" ]; then
+  echo "❌ 端口 ${TARGET_PORT} 15s 后仍未监听，启动失败" >&2
+  exit 1
+fi
+
+# 再等首个 page 目标（启动 NTP/会话恢复标签）出现才返回：DevTools 端口监听早于启动标签创建。
+# 不等的话，上层 playwright-mcp 连接时 pages() 为空 → ensureTab() 另开新标签/新窗口，
+# 启动 NTP 标签留在原地 → 「先开一个空窗口，再开第二个访问网页」。
+page_seen=0
+for i in $(seq 1 20); do
+  if curl -s --max-time 2 "http://127.0.0.1:${TARGET_PORT}/json/list" | grep -q '"type": "page"'; then
+    page_seen=1; break
+  fi
+  sleep 0.5
+done
+if [ "$page_seen" = "1" ]; then
+  echo "✅ Agent Chrome 就绪 — 端口 ${TARGET_PORT}（${OWNER}，启动标签已就绪）"
+else
+  echo "⚠️ 端口 ${TARGET_PORT} 就绪但 10s 未见 page 目标，放行（上层将自建标签）" >&2
+  echo "✅ Agent Chrome 就绪 — 端口 ${TARGET_PORT}（${OWNER}）"
+fi
+exit 0

@@ -122,7 +122,10 @@ let browserPid = null;
 let closeRequestId = null; // 等待中的 browser_close 响应 id
 
 function spawnBackend(endpoint) {
-  const args = [CLI, "--cdp-endpoint", endpoint, "--browser", "chrome", "--isolated"];
+  // 不加 --isolated:该 flag 会让 backend 对接管 Chrome 自建隔离 BrowserContext,
+  // 永不认领启动 NTP 标签,首次 navigate 必开第二个窗口(空窗口+新窗口双开)。
+  // 去掉后 backend 用默认 context,配合 cdp-takeover 等启动标签就绪,原地导航。
+  const args = [CLI, "--cdp-endpoint", endpoint, "--browser", "chrome"];
   const child = spawn("node", args, { stdio: ["pipe", "pipe", "pipe"] });
   log(`backend spawn: node ${CLI.split("/").pop()} → ${endpoint}(PID ${child.pid})`);
   // stderr 限流:防 playwright-mcp 刷屏淹没事件循环
