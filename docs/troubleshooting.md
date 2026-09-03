@@ -200,6 +200,20 @@ rm -rf /tmp/zcode-cdp/ports/9223.lock
 
 ---
 
+### Chrome instance alive but zero tabs open
+
+**Symptom**: CDP self-check fails (e.g. "connection refused"-adjacent health errors or a probe that expects at least one tab), yet the DevTools port still answers — the durable Chrome is running with no open tabs (after a crash, or the last tab was closed manually).
+
+**Fix**: no restart needed (restarting the durable Chrome risks disturbing the logged-in profile for nothing). Just open a fresh tab through the DevTools HTTP endpoint:
+
+```bash
+curl -X PUT "http://127.0.0.1:<port>/json/new"
+```
+
+The instance comes back with one new tab and the profile/login state intact. Verified in practice 2026-08-29: a nightly pipeline's CDP self-check failed once with zero tabs; a single `PUT /json/new` recovered it without restarting Chrome.
+
+---
+
 ## Debug logging
 
 All proxy logs go to **stderr** (stdout is reserved for the MCP JSON-RPC protocol).
