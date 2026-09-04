@@ -140,38 +140,17 @@ grep -i endpoint your-script.py
 
 ### Proxy CPU 99% for hours, won't respond to SIGTERM
 
-> **2026-07-26 root cause**: EPIPE exception storm. Parent agent exits → stderr pipe closes → every `log()` throws EPIPE → `uncaughtException` handler calls `log()` again → infinite recursive exception → V8 stack-capture storm → CPU 100%, all watchdogs fail because they depend on the event loop running.
-
-**If this somehow recurs** (it shouldn't — v0.1.0 has the fix):
+Typical cause: an exception storm (e.g. EPIPE from a closed stderr pipe after the parent agent exits) keeps V8 capturing stacks at full CPU; watchdogs that depend on the event loop can't run. Current versions exit hard on `uncaughtException` to prevent this, but if you ever see a proxy burning CPU:
 
 ```bash
 # Step 1: DO NOT GUESS — sample the stack first
 sample <pid> 5
 
 # If you see TriggerUncaughtException / CaptureSimpleStackTrace dominating
-# → it's still an exception storm (some other IO is throwing)
+# → it's an exception storm (some IO is throwing)
 # Step 2: stop the bleeding
 kill -9 <pid>
 ```
-
-See [`watchdog-postmortem.md`](watchdog-postmortem.md) for the full story.
-
----
-
-### Browser opens an empty window first, then a second window for the actual page
-
-> **2026-09-01 root cause** (fixed in fc03f38): two stacked issues.
-
-**Symptom**: on lazy start, the takeover Chrome shows a blank NTP window first, then a second window opens with the target page. One redundant blank window every time (sometimes manifesting as two tabs).
-
-**Cause (two layers, both required to fix)**:
-
-1. **`zcode-cdp-proxy.js` passed `--isolated` to playwright-mcp.** With `--cdp-endpoint`, that flag makes the backend create its own isolated BrowserContext (`Target.createBrowserContext` + `Target.createTarget` in it — captured via `DEBUG=pw:protocol`), so it **never claims the startup NTP tab**; the first `browser_navigate` always opens a new window. The takeover Chrome already runs a dedicated profile per port — the isolation is pointless. Fix: drop the flag; the backend then uses the default context and claims the startup tab.
-2. **The DevTools port listens before the startup tab exists** (race). `cdp-takeover` used to return as soon as the port listened, so the backend could connect while `pages()` was still empty → `ensureTab()` still created an extra tab. Fix: after the port listens, poll `/json/list` until a `type=page` target appears (≤10s, fail-open) before reporting ready.
-
-**How this was pinned down** (reusable technique): reproduce via the full proxy chain, then re-run with `DEBUG=pw:protocol` inherited by the backend and grep `Target.attachedToTarget` / `Target.createBrowserContext` — the NTP attaching in the default context while the backend's page lands in a *different* context id is the smoking gun.
-
-**Lesson**: for flags that configure page/context ownership on an attached browser (`--isolated`, `--extension`, viewport options), verify against the CDP target graph, not just "it connects and navigates".
 
 ---
 
@@ -210,7 +189,7 @@ rm -rf /tmp/zcode-cdp/ports/9223.lock
 curl -X PUT "http://127.0.0.1:<port>/json/new"
 ```
 
-The instance comes back with one new tab and the profile/login state intact. Verified in practice 2026-08-29: a nightly pipeline's CDP self-check failed once with zero tabs; a single `PUT /json/new` recovered it without restarting Chrome.
+The instance comes back with one new tab and the profile/login state intact — no restart needed (restarting the durable Chrome risks disturbing the logged-in profile for nothing).
 
 ---
 
@@ -228,7 +207,7 @@ tail -f proxy.log
 
 Log lines look like:
 ```
-[cdp-proxy 54278 14:23:01] READY_IDLE — placeholder spawned
+[cdp-proxy 54278 14:23:01] IDLE — backend spawned
 [cdp-proxy 54278 14:23:15] activating (port 9223)
 [cdp-proxy 54278 14:23:18] ACTIVE — backend ready
 ```

@@ -4,7 +4,7 @@
 // 作为 config.json 里 cdp 的 command。每个 ZCode 会话独立 spawn 一个本 proxy。
 // proxy 全权持有 stdio(MCP JSON-RPC 通道),背后挂一个常驻 playwright-mcp:
 //
-// 架构(2026-08-15 relay 重写,取代 placeholder/real 双 backend 切换):
+// 架构(本地中继):
 //   - 启动:在 127.0.0.1 随机端口开一个无状态 TCP 中继,spawn 唯一的
 //     playwright-mcp,endpoint 永远指向中继 → backend 从生到死只起一次。
 //   - 中继:纯字节管道,零解析。无 upstream(Chrome)时挂起新连接(带超时),
@@ -16,11 +16,11 @@
 //   - 依据:playwright-mcp 单实例在 browser_close 后可完全复用(实验证实,
 //     见 docs/architecture.md),Chrome 起停/端口轮换对 backend 只是断线重连。
 //
-// 保留的事故防线(勿删,均有真实事故背书,详见 docs/watchdog-postmortem.md):
+// 防护设计(勿删):
 //   - 三层看门狗:软(事件循环 lag)/孤儿(业务心跳超时)/硬(worker 线程 SIGKILL)
 //   - stdout/stderr 限流与 buf 上限、stdin inBuf 上限(防 O(n²) 与刷屏)
 //   - 启动期同父进程去重(防 proxy 堆积)
-//   - uncaughtException 纯同步退出(EPIPE 异常风暴教训:绝不写已坏的 stderr)
+//   - uncaughtException 纯同步退出(绝不写可能已坏的 stderr,防递归异常风暴)
 //
 // 端口池:9223-9229(7 个会话临时端口)。脚本 durable 端口使用 93xx,不进租约池。
 // 租约:统一使用 zcode-cdp-lease.js 管理(原子 mkdir + leaseId ownership 校验)。
@@ -72,9 +72,9 @@ const HARD_CPU_TRIES = parseInt(process.env.CDP_HARD_CPU_TRIES || "5", 10);     
 const INBUF_MAX_BYTES = parseInt(process.env.CDP_INBUF_MAX_BYTES || String(2 * 1024 * 1024), 10); // stdin inBuf 上限 2MB(防无换行堆积)
 
 // ---------------- 日志(全走 stderr,MCP 协议走 stdout) ----------------
-// ⚠️ log() 必须 swallow write 错误:父 zcode-cli 退出后 stderr pipe 对端关闭,
+// ⚠️ log() 必须 swallow write 错误:父进程退出后 stderr pipe 对端关闭,
 // process.stderr.write 抛 EPIPE → 触发 uncaughtException → handler 里若再 log() 会
-// 递归异常风暴(2026-07-26 PID 13503 事故根因)。这里 try/catch 兜底,write 失败静默。
+// 递归异常风暴。这里 try/catch 兜底,write 失败静默。
 function log(...a) {
   try { process.stderr.write(`[cdp-proxy ${process.pid} ${hhmmss()}] ${a.join(" ")}\n`); } catch {}
 }
@@ -84,7 +84,7 @@ function hhmmss() { const d = new Date(); return [d.getHours(), d.getMinutes(), 
 // IDLE → ENSURING → ACTIVE → CLOSING → IDLE;(any) → SHUTTING_DOWN → EXITED
 // CLOSING:browser_close 响应已返回、租约/中继正在释放的过渡窗口。
 // 该窗口内到达的 browser_close 直接返回成功(浏览器确实在关闭),避免走真转发
-// 路径触发 backend 重连 → 挂起连接 → 误"自动重新激活"(旧架构 CLOSE_PENDING 的等价物)。
+// 路径触发 backend 重连 → 挂起连接 → 误"自动重新激活"。
 const ST = {
   IDLE: "IDLE",
   ENSURING: "ENSURING",
@@ -247,8 +247,7 @@ function ensure() {
 }
 
 // 释放浏览器:断中继、释放租约(内含杀 Agent Chrome)、回 IDLE。
-// teardown 完成时若中继仍有挂起连接(释放期间到达的新请求)→ 自动重新 ensure,
-// 这就是旧架构 activationBatch 重放的等价语义。
+// teardown 完成时若中继仍有挂起连接(释放期间到达的新请求)→ 自动重新 ensure。
 async function teardown() {
   closeRequestId = null;
   setState(ST.CLOSING);
@@ -359,18 +358,11 @@ let lastBusinessTime = Date.now();
 const BUSINESS_METHODS = /^(initialize$|notifications\/initialized$|tools\/|resources\/|prompts\/|ping$)/;
 
 // ---- 硬看门狗(worker 线程,免疫主线程 busy-loop)----
-// 根因:旧版看门狗用 setInterval,跑在主线程事件循环里。当主线程陷入同步 busy-loop
-// (如 inBuf 无换行无限增长、或某段代码死循环),事件循环被完全阻塞,setInterval 回调
-// 永远排不上队 → 看门狗自己也被卡死,防线形同虚设。PID 19791 正是此场景:99% CPU 跑了
-// 19 小时,看门狗一次都没触发。
-//
-// 解法:把看门狗放到 worker_threads。worker 有独立的事件循环和 libuv 线程池,主线程
-// busy-loop 不影响 worker 的 setInterval 计时。worker 每 2s 检查主线程发来的心跳时间戳;
-// 超过 HARD_KILL_MS 无新心跳 → worker 直接 process.kill(SIGKILL) 干掉主进程(SIGKILL
-// 不可被拦截,绕过 cleanupAndExit 的所有异步逻辑,确保必死)。
-//
-// 心跳机制:主线程在 stdin data + 每秒 setInterval 里 postMessage 更新心跳。正常情况
-// 心跳频繁,worker 永不触发。主线程卡死 → 心跳停 → worker 60s 后杀。
+// 为什么放 worker:主线程 busy-loop(同步死循环/长同步块)会完全阻塞事件循环,跑在
+// 主线程的看门狗(setInterval)自己也被卡死,防线形同虚设。worker 有独立的事件循环
+// 和 libuv 线程池,不受影响。worker 每 2s 检查主线程心跳,超过 HARD_KILL_MS 无新心跳
+// → 直接 process.kill(SIGKILL) 主进程(不可拦截,绕过所有 async cleanup,确保必死)。
+// 心跳机制:主线程在 stdin data + 每秒 setInterval 里 postMessage 更新心跳。
 const { Worker } = require("worker_threads");
 let hardWatchdogWorker = null;
 let heartbeatTimer = null;
@@ -378,21 +370,13 @@ let heartbeatTimer = null;
 function startHardWatchdog() {
   stopHardWatchdog();
   // Worker 源码用内联 Blob,避免外部文件依赖
-  // ⚠️ kill 目标修正:旧版用 process.ppid(主进程的父进程 = launchd, PID 1),普通用户
-  //    EPERM 失败 → 硬看门狗形同虚设,主线程 busy-loop 时进程能裸奔十几小时不被杀
-  //    (PID 19791 跑 19h、PID 54278 跑 15h 均因此)。改由主线程启动时 postMessage 传入
-  //    主进程真实 PID,worker 用它来 SIGKILL。不依赖 worker 内 process.pid/ppid 歧义语义。
+  // ⚠️ SIGKILL 目标 PID 由主线程 postMessage 传入,不用 process.ppid
+  //    (ppid 在某些环境下指向 launchd PID 1,普通用户 EPERM,看门狗形同虚设)。
   //
-  // ⚠️ 双路检测(2026-07-26 新增第 2 路):原心跳机制只能抓"主线程完全卡死"(连 setInterval
-  //    回调都排不上)。但 PID 64663/84030/90434/97706 实测是"间歇 busy-loop"——主线程反复
-  //    陷长同步块(秒级),块间间隙让 setInterval 回调被批量补跑,心跳照常发,worker 看到的
-  //    lag 始终很小 → 永不触发。新增第 2 路独立 CPU 检测:worker 自己 execSync('ps -p <pid>
-  //    -o time=') 读主进程 CPU 时间,两次采样算增量,完全绕过主线程事件循环。
-  //    详见 knowledge/general/cdp.md §4 看门狗事故记录。
-  //
-  // ⚠️ 判定策略用"滑动窗口"而非"连续 N 次":间歇 busy-loop(如 5s 块 + 1s 间隙)周期里,
-  //    worker 2s 采样一次,采样点会周期性落在间隙上(测到 50%),连续判定永远凑不齐。
-  //    改成最近 N 次采样里 ≥ M 次高 CPU 就触发,容忍偶尔落在间隙的样本。
+  // ⚠️ 双路检测:第 1 路心跳只能抓"主线程完全卡死";"间歇 busy-loop"(反复陷入长
+  //    同步块,块间间隙让 setInterval 补跑、心跳照常)永远不触发。第 2 路 worker
+  //    自己 execSync('ps -p <pid> -o time=') 采样主进程 CPU 增量,完全绕过主线程
+  //    事件循环。判定用滑动窗口(最近 2N 次采样 ≥ N 次超阈值),容忍间隙样本。
   const workerSrc = `
     const { parentPort } = require("worker_threads");
     const { execSync } = require("child_process");
@@ -459,9 +443,8 @@ function startHardWatchdog() {
     });
   } catch (e) {
     // fail-loud:硬看门狗是唯一能补救主线程 busy-loop 的防线(前两层 setInterval 都跑
-    // 在主线程,卡死时一起死)。启动失败还继续跑 = 裸奔,等于把事故风险留到下一次复现。
-    // 直接退出,ZCode 会立即重拉新实例,新实例大概率能正常起 worker。
-    // 详见 knowledge/general/cdp.md §4 看门狗事故记录。
+    // 在主线程,卡死时一起死)。启动失败还继续跑 = 裸奔。
+    // 直接退出,客户端会立即重拉新实例,新实例大概率能正常起 worker。
     process.stderr.write(`[cdp-proxy ${process.pid} ${hhmmss()}] ⛔ 硬看门狗 worker 启动失败: ${e.message} → 退出重拉,避免裸奔\n`);
     process.exit(1);
   }
@@ -506,8 +489,7 @@ function startWatchdog() {
         // (每次同步块产生墙钟延迟,累积到 WATCHDOG_TRIES 次就触发),但 cleanupAndExit
         // 内含 await releaseLease(),主线程下一秒又进同步块 → await 排不进 → 卡在
         // SHUTTING_DOWN,proxy 半死不活。改同步 process.exit 打破这个死结。
-        // 资源清理交给 OS(Chrome/backend SIGTERM 由 exit hook 兜底),ZCode 会重拉新实例。
-        // 详见 knowledge/general/cdp.md §4 看门狗事故记录(2026-07-26)。
+        // 资源清理交给 OS(Chrome/backend SIGTERM 由 exit hook 兜底),客户端会重拉新实例。
         log(`🔥 CPU 看门狗触发:事件循环连续 ${WATCHDOG_TRIES} 次延迟超 ${WATCHDOG_LAG_MS}ms → 同步强制退出(不走 async cleanup,避免间歇 busy-loop 卡死 cleanup)`);
         process.exit(99);
       }
@@ -540,7 +522,6 @@ process.stdin.on("data", chunk => {
   inBuf += chunk;
 
   // inBuf 上限保护:超 INBUF_MAX_BYTES 截断到最后 64KB(防无换行大数据块无限增长 → O(n²) + OOM)
-  // 场景:zcode-cli 发了畸形/超长无换行数据,旧版 inBuf 无限增长 → 字符串拼接 O(n²) → CPU 100%
   if (inBuf.length > INBUF_MAX_BYTES) {
     log(`⚠️ stdin inBuf 超 ${INBUF_MAX_BYTES} bytes,截断到最后 64KB(可能是无换行大数据块)`);
     inBuf = inBuf.slice(-65536);
@@ -690,11 +671,9 @@ process.on("SIGTERM", () => cleanupAndExit(0));
 process.on("SIGINT", () => cleanupAndExit(0));
 process.on("SIGHUP", () => cleanupAndExit(0));
 // ⚠️ uncaughtException / unhandledRejection 必须纯同步、绝不写 stderr、直接 process.exit。
-// 2026-07-26 事故根因(经 sample 取证坐实):父 zcode-cli 退出后 stderr pipe 对端关闭,
-// 任何 log() → process.stderr.write 抛 EPIPE → 触发本 handler → handler 又调 log()
-// → 又 write → 又 EPIPE → 无限递归异常风暴。V8 疯狂抓堆栈(CaptureSimpleStackTrace)
-// 占满 CPU,worker 线程也被拖累无法 SIGKILL。PID 13503 跑 13 分钟烧核即此场景。
-// 修复:handler 里只用 try/catch 包裹的同步操作,绝不 write 已坏的 stderr,直接 exit。
+// 父进程退出后 stderr pipe 对端关闭,任何 log() → process.stderr.write 抛 EPIPE → 触发
+// 本 handler → handler 又调 log() → 无限递归异常风暴,V8 疯狂抓栈占满 CPU。
+// 修复原则:handler 里只用 try/catch 包裹的同步操作,绝不 write 可能已坏的 stderr,直接 exit。
 process.on("uncaughtException", () => {
   try { process.exit(1); } catch {}
   process.exit(1);
