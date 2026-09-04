@@ -157,6 +157,15 @@
    - **ZCode**: 写入 `~/.zcode/cli/config.json`
    - **Claude Code**: 写入 `~/.claude.json`，或项目级 `.mcp.json`
    - （Claude Code 用户也可直接用下文的 `cdpcc` 命令，免去手改配置）
+   - **Codex**（CLI / ChatGPT.app 内置版）：写入 `~/.codex/config.toml`，TOML 格式：
+
+     ```toml
+     [mcp_servers.cdp]
+     command = "/usr/local/bin/node"   # 建议绝对路径，App 环境的 PATH 可能不全
+     args = ["/absolute/path/to/zcode-cdp/bin/zcode-cdp-proxy.js"]
+     ```
+
+     Codex 直接走 lazy proxy 模式（首次 `browser_*` 自动起 Chrome、`browser_close` 自动释放），无需 hook（`cdp-ensure.sh` 仅服务 Claude Code 的 cdpcc 链路）。
 
 4. **重启 agent** —— 现在你的工具列表里多了一批 `mcp__cdp__browser_*`（navigate / click / type / snapshot / screenshot ……）。
 
@@ -296,7 +305,7 @@ CHANGELOG 见 [`CHANGELOG.md`](./CHANGELOG.md)，bug 上报模板见 [`.github/I
 - **macOS**：主力测试平台，开箱即用。
 - **Linux**：应该可用，但 Chrome profile 源路径需手动调整（默认硬编码 macOS 路径 `~/Library/Application Support/Google/Chrome`，Linux 下通常是 `~/.config/google-chrome`），`lsof` / `stat` 语法差异也已尽量规避。
 - **Windows**：未测试，欢迎反馈。
-- **Agent 客户端**：支持任何能注册 stdio MCP server 的客户端 —— ZCode、Claude Code、Codex 等。
+- **Agent 客户端**：支持任何能注册 stdio MCP server 的客户端 —— ZCode、Claude Code、Codex（codex-cli 0.153 / ChatGPT.app 内置版实测：`codex exec` 走通 navigate → 读取页面标题 → close 全链路，端口租约正常释放）等。
 
 ---
 

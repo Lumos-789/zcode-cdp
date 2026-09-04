@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Codex 客户端接入** — README 补 `~/.codex/config.toml` 的 `[mcp_servers.cdp]` TOML 注册方式。
+  Codex 没有 PreToolUse hook，直接走 lazy proxy 模式（首次 `browser_*` 自动起 Chrome、
+  `browser_close` 自动释放），无需 `cdp-ensure.sh`（该 hook 仅服务 Claude Code 的 cdpcc 链路）。
+  实测：ChatGPT.app 内置 codex-cli 0.153.0-alpha.5，`codex exec` 一次通过
+  navigate → 读取页面标题 → browser_close，会话池端口租约正常释放。
+
 ### Fixed
 - **cdp-takeover: 扩展工具栏 pin 状态同步** — Chrome 在拷贝的 user-data-dir 中会重置
   `extensions.pinned_extensions`(实测 9224 从 4 个掉到 1 个),接管窗口的工具栏因此
