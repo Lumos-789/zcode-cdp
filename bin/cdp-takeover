@@ -29,8 +29,8 @@ set -euo pipefail
 # 会话临时池（ZCode/Codex/cdpcc 从中 pick 空闲）
 PORTS=(9223 9224 9225 9226 9227 9228 9229)
 # status 展示用（含脚本固定端口示例，用户可按需修改）
-SCRIPT_PORTS=(9324 9326)
-ALL_PORTS=(9223 9224 9225 9226 9227 9228 9229 9324 9326)
+SCRIPT_PORTS=(9324 9325 9326)
+ALL_PORTS=(9223 9224 9225 9226 9227 9228 9229 9324 9325 9326)
 # 93xx 端口用途示例（用户按需自定）：9324 / 9326 可作为 durable 客户端固定端口
 PROFILE_SRC="$HOME/Library/Application Support/Google/Chrome"
 LOCKDIR="/tmp/cdp-takeover.$USER.lock"
@@ -47,6 +47,7 @@ port_meta() {
     9228) echo "session|48|-1655,-590" ;;
     9229) echo "session|52|-1655,-440" ;;
     9324) echo "scripts|58|-1350,-1190" ;;
+    9325) echo "scripts|59|-1350,-1040" ;;  # MjAI 周榜守护 durable（week_guard.py 专用）
     9326) echo "scripts|60|-1350,-890" ;;
     *) return 1 ;;
   esac
