@@ -15,13 +15,16 @@
 #     用于直接 CDP 客户端（Python 裸 WebSocket / playwright connect_over_cdp）。
 #   - managed（--managed --lease-id <id>）：由 zcode-cdp-proxy/cdpcc 调用，
 #     核验调用者拥有端口 lease 后启动 Chrome。proxy/cdpcc 退出时通过 lease 释放。
+#     参数组必须完整：--managed 与 --lease-id、显式端口三缺一即 stderr 报错 exit 1
+#     （fail-loud），绝不静默跳过 lease 核验按 durable 降级启动。
 #
 # 用法：
 #   cdp-takeover                    自动找第一个空闲端口（durable）
 #   cdp-takeover <port>             显式端口（9223-9229 / 93xx）（durable）
 #   cdp-takeover <port> --refresh   强制从源 rsync 该端口 profile（实例须已关）
 #   cdp-takeover --refresh <port>   同上
-#   cdp-takeover <port> --managed --lease-id <id>   managed 模式（proxy/cdpcc 内部用）
+#   cdp-takeover <port> --managed --lease-id <id>   managed 模式（proxy/cdpcc 内部用；
+#                                                   三参数缺一即报错退出，不降级 durable）
 #   cdp-takeover status             打印端口占用表
 
 set -euo pipefail
@@ -166,19 +169,36 @@ while [ $# -gt 0 ]; do
     status) do_status; exit 0 ;;
     --refresh) REFRESH=1 ;;
     --managed) MANAGED=1 ;;
-    --lease-id) shift; LEASE_ID="${1:-}" ;;
+    # 值缺失即拒：--lease-id 作为末参时后续 shift 会在 set -e 下静默退出，
+    # 配对错误反而拿不到报错，所以这里显式 fail-loud
+    --lease-id)
+      shift
+      LEASE_ID="${1:-}"
+      [ -n "$LEASE_ID" ] || { echo "❌ --lease-id 需要一个值" >&2; exit 1; } ;;
     ''|*[0-9]*) TARGET_PORT="$1" ;;
     *) echo "❌ 未知参数：$1（用法见脚本头注释）" >&2; exit 1 ;;
   esac
   shift
 done
 
-acquire_lock
-
 # managed 模式:核验调用者拥有端口 lease（proxy/cdpcc 内部调用专用）
-if [ "$MANAGED" = "1" ] && [ -n "$TARGET_PORT" ] && [ -n "$LEASE_ID" ]; then
+# fail-loud：--managed 必须与 --lease-id、显式端口成对传入；此前条件不满足会静默
+# 跳过 lease 核验、按 durable 启动（安全面静默降级），现改为缺任一即报错 exit 1。
+# 校验放在 acquire_lock 之前：注定失败的参数组不占全局锁。
+# 注意：bash 3.2 下 $var 紧跟多字节字符会把字节吸进变量名，扩展一律 ${var} 包裹。
+if [ "$MANAGED" = "1" ]; then
+  if [ -z "$TARGET_PORT" ] || [ -z "$LEASE_ID" ]; then
+    missing=""
+    [ -z "$TARGET_PORT" ] && missing="--target-port（位置参数 <port>）"
+    [ -z "$LEASE_ID" ] && missing="${missing:+${missing}、}--lease-id"
+    echo "❌ --managed 需要 --lease-id 与 --target-port（本次缺少：${missing}）" >&2
+    echo "   参数组不完整即拒绝启动，不降级为 durable；补全后重试。" >&2
+    exit 1
+  fi
   verify_lease "$TARGET_PORT" "$LEASE_ID"
 fi
+
+acquire_lock
 
 # 确定目标端口
 if [ -z "${TARGET_PORT}" ]; then

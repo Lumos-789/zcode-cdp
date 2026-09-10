@@ -72,7 +72,7 @@ proxy 是**请求观察者**：所有 client→backend 消息照常透传，仅�
 ## 4. cdp-takeover 双模式
 
 - **durable**（默认）：`cdp-takeover [port] [--refresh]`，人工/脚本直调，跨客户端长期存在，不创建会话 lease。
-- **managed**（`--managed --lease-id <id>`）：由 proxy / cdpcc 调用，核验租约所有权后启动；proxy/cdpcc 退出时通过 lease 释放自动带走 Chrome。
+- **managed**（`--managed --lease-id <id>`）：由 proxy / cdpcc 调用，核验租约所有权后启动；proxy/cdpcc 退出时通过 lease 释放自动带走 Chrome。参数组 fail-loud：`--managed` 必须与 `--lease-id`、显式端口成对传入，缺任一即 stderr 报错并 exit 1，绝不静默跳过 lease 核验按 durable 降级启动。
 
 启动参数：`--remote-debugging-port` / `--remote-allow-origins=*` / `--user-data-dir=<每端口目录>` / 每端口不同 `--window-position` / `--no-first-run --no-default-browser-check`；启动后轮询端口监听，15s 不就绪判失败。
 
