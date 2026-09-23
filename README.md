@@ -118,7 +118,7 @@ with sync_playwright() as p:
 | 变量 | 默认 | 作用 |
 |---|---|---|
 | `CDP_PORTS` | `9223...9229` | 会话临时端口池 |
-| `CDP_SCRIPT_PORTS` | `9324 9326` | 脚本固定端口（status 显示用） |
+| `CDP_SCRIPT_PORTS` | `9324 9326` | 脚本固定端口（status 显示用；cdp-takeover 实际内置 9324 9325 9326，其中 9325 为 MjAI 周榜守护 durable 槽，要 status 展示设 `9324 9325 9326`） |
 | `CDP_LOCK_ROOT` | `/tmp/zcode-cdp/ports` | 租约锁目录 |
 | `CDP_ORPHAN_TIMEOUT_MS` | 30min | 无业务空闲自退 |
 | `CDP_HARD_KILL_MS` / `CDP_HARD_CPU_THRESHOLD` | 60s / 85% | 硬看门狗阈值 |

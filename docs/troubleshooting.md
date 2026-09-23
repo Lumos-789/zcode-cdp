@@ -221,7 +221,7 @@ Log lines look like:
 | `CDP_PLAYWRIGHT_MCP_CLI` | auto-resolved | Path to `@playwright/mcp/cli.js` |
 | `CDP_TAKEOVER` | `<repo>/bin/cdp-takeover` | Path to the takeover script |
 | `CDP_PORTS` | `9223 ... 9229` | Session-temporary pool |
-| `CDP_SCRIPT_PORTS` | `9324 9326` | Script-fixed ports for status display |
+| `CDP_SCRIPT_PORTS` | `9324 9326` | Script-fixed ports for status display (cdp-takeover ships 9324 9325 9326; 9325 = durable slot for the MjAI week guard) |
 | `CDP_LOCK_ROOT` | `/tmp/zcode-cdp/ports` | Where lock files live |
 | `CDP_ORPHAN_TIMEOUT_MS` | `1800000` (30min) | Idle proxy self-exit |
 | `CDP_HARD_KILL_MS` | `60000` | Hard watchdog heartbeat timeout |

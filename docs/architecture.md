@@ -63,7 +63,7 @@ proxy 是**请求观察者**：所有 client→backend 消息照常透传，仅�
 | 端口段 | 用途 | 进租约池 |
 |--------|------|-----------|
 | 9223-9229（7 个） | 会话临时池 | 是（`CDP_PORTS`） |
-| 9324, 9326 | 脚本固定端口（durable 直连） | 否（`CDP_SCRIPT_PORTS`，只判端口忙） |
+| 9324-9326 | 脚本固定端口（durable 直连；cdp-takeover 内置三口，9325 为 MjAI 周榜守护 durable 槽） | 否（`CDP_SCRIPT_PORTS`，只判端口忙） |
 
 分两段的原因：durable Chrome 的登录态是长期积累的稀缺资源，绝不能被会话池 pick 走。每端口还有独立 profile（`--user-data-dir`）与不同头像，做到**端口 + profile 两层隔离**。
 

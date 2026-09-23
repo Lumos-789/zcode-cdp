@@ -24,10 +24,10 @@ The lease model solves all four by combining **atomic acquisition** (`mkdir`) wi
 | Range | Purpose | Manager |
 |-------|---------|---------|
 | **9223–9229** | Session temporary pool (7 slots) — ZCode/Codex/cdpcc pick from here | proxy + cdpcc via `zcode-cdp-lease.js` |
-| **93xx** (e.g. 9324, 9326) | Script-fixed durable ports — Python/playwright clients | User-managed, **not** in the shared pick pool |
+| **93xx** (e.g. 9324–9326) | Script-fixed durable ports — Python/playwright clients (9325 is the durable slot dedicated to the MjAI week guard) | User-managed, **not** in the shared pick pool |
 | 9222 | Historical default (playwright-mcp / legacy) | Not in current pool |
 
-> Configure via env: `CDP_PORTS="9223 9224 9225 9226 9227 9228 9229"` and `CDP_SCRIPT_PORTS="9324 9326"`.
+> Configure via env: `CDP_PORTS="9223 9224 9225 9226 9227 9228 9229"` and `CDP_SCRIPT_PORTS="9324 9326"` (lease default; `cdp-takeover` ships 9324 9325 9326 — set `"9324 9325 9326"` to include the durable slot in status).
 
 ### Why split into two ranges
 Session-temporary ports are picked automatically and released on session exit. Script-fixed ports belong to long-lived durable Chromes that you start manually with `cdp-takeover <port>`; they must **not** be picked by the session pool, otherwise a session would steal a durable browser's login state.

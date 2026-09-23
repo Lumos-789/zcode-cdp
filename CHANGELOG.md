@@ -4,6 +4,7 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+- 文档：端口表同步 9325 durable 槽实况——README / architecture / port-lease / troubleshooting 标注 cdp-takeover 内置 9324 9325 9326（9325 为 MjAI 周榜守护专用）；lease 默认 `CDP_SCRIPT_PORTS=9324 9326` 不变
 ## [0.2.0] — 2026-08-15
 
 - relay 架构：本地 TCP 中继 + 单常驻 backend，激活循环零重启；CLOSING 过渡态防重复激活
