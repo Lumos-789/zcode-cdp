@@ -1,19 +1,21 @@
 #!/usr/bin/env node
 // zcode-cdp-lease — 统一 CDP 端口租约管理
 //
-// 供 zcode-cdp-proxy.js (require) 和 cdpcc/cdp-takeover (CLI) 共享，消除三套
+// 供 zcode-cdp-proxy.js (require) 和 cdp-takeover (CLI) 共享，消除两套
 // 各自不一致的锁判断。核心不变量：
 //   - mkdir 是唯一原子抢占点
 //   - owner.json 含 leaseId，删除/更新前必须核对，防 PID 复用和误删新锁
 //   - 非 Agent listener 永不自动 kill
-//   - 无 lease 的 durable Agent Chrome 只当「端口忙」处理，不抢占
+//   - 完全无锁的 durable Agent Chrome 只当「端口忙」处理，不抢占（人工 durable
+//     是合法形态）；有锁但 owner 无效的 Agent Chrome 是 SIGKILL 崩溃残留，可回收
+//   - owner 必须是常驻进程：短命 CLI 一退出 pid 即成孤儿（cdpcc 因此下线）
 //   - Chrome 未退出前不得释放 lease
 //
 // 锁格式:
-//   $LOCK_ROOT/<port>.lock/        ← mkdir 原子抢锁
-//   $LOCK_ROOT/<port>.lock/owner.json
+//   $LOCK_ROOT/<port>.lock/           ← mkdir 原子抢锁
+//   $LOCK_ROOT/<port>.lock/owner.json ← hbAt 为毫秒 epoch 心跳，ENSURING 期间持有者刷新
 //
-// 兼容旧锁(只读判定，不创建):
+// 兼容旧锁(只读判定，不创建;保留清理 v0.1.0 残留):
 //   /tmp/zcode-cdp-port-<port>.lock/pid   (旧 proxy)
 //   /tmp/cdpcc-port-<port>.lock/pid       (旧 cdpcc)
 //
@@ -35,13 +37,33 @@ const os = require("os");
 const { execSync } = require("child_process");
 
 // ---- 可测试性：环境覆盖，生产默认不变 ----
+// env 数值解析 fail-loud：非法值点名报错退出，绝不静默回退默认掩盖配置错误
+function intEnv(name, fallback) {
+  const raw = process.env[name];
+  if (raw === undefined || raw === "") return fallback;
+  const v = Number(raw);
+  if (!Number.isInteger(v)) {
+    process.stderr.write(`[lease] 环境变量 ${name} 非法(需整数): "${raw}"\n`);
+    process.exit(1);
+  }
+  return v;
+}
+
+function portsEnv(name, fallback) {
+  const raw = process.env[name] === undefined || process.env[name] === "" ? fallback : process.env[name];
+  const ports = raw.split(/\s+/).filter(Boolean).map(Number);
+  if (!ports.length || ports.some(p => !Number.isInteger(p))) {
+    process.stderr.write(`[lease] 环境变量 ${name} 非法(需空格分隔端口号): "${raw}"\n`);
+    process.exit(1);
+  }
+  return ports;
+}
+
 const LOCK_ROOT = process.env.CDP_LOCK_ROOT || "/tmp/zcode-cdp/ports";
-const SHARED_PORTS = (process.env.CDP_PORTS || "9223 9224 9225 9226 9227 9228 9229")
-  .split(/\s+/).filter(Boolean).map(Number);
-const SCRIPT_PORTS = (process.env.CDP_SCRIPT_PORTS || "9324 9326")
-  .split(/\s+/).filter(Boolean).map(Number);
-const STARTUP_GRACE_MS = parseInt(process.env.CDP_STARTUP_GRACE_MS || "8000", 10);
-const STALE_LOCK_AGE_MS = parseInt(process.env.CDP_STALE_LOCK_AGE_MS || "30000", 10);
+const SHARED_PORTS = portsEnv("CDP_PORTS", "9223 9224 9225 9226 9227 9228 9229");
+const SCRIPT_PORTS = portsEnv("CDP_SCRIPT_PORTS", "9324 9326");
+// 默认须 >= cdp-takeover 自身 15s 监听预算；首启整 profile rsync(分钟级)靠持有者 hb 心跳兜底
+const STARTUP_GRACE_MS = intEnv("CDP_STARTUP_GRACE_MS", 15000);
 
 // ---- 工具函数 ----
 function nowISO() { return new Date().toISOString(); }
@@ -132,15 +154,24 @@ function ownerPidValid(pid, expectedStartTime, marker) {
 
 // ---- 端口忙判定（含 listener + 新 lease + 旧锁 + durable Chrome） ----
 // 返回: { busy: bool, reason: string, ownerKind?: string }
+//   stale/zombie 时附 owner: 判定时的 owner.json 快照(null=裸锁)，供删除前复核防 TOCTOU
 function checkPort(port) {
   // 1. 端口有 listener
   const listener = portPid(port);
   if (listener) {
     if (isAgentChromePid(listener)) {
-      // 有 Agent Chrome 监听。如果有 lease 且 owner 匹配 → active；无 lease → durable 占用
+      // 有 Agent Chrome 监听：lease 且 owner 有效 → active；有锁但 owner 无效 →
+      // SIGKILL 崩溃残留，可回收；完全无锁 → 人工 durable 合法占用，绝不抢占
       const owner = readOwner(port);
       if (owner && ownerPidValid(owner.ownerPid, owner.ownerStartTime, owner.kind)) {
         return { busy: true, reason: `active lease (owner ${owner.kind} PID ${owner.ownerPid})`, ownerKind: owner.kind, leaseState: owner.state };
+      }
+      if (owner || fs.existsSync(lockPath(port))) {
+        return {
+          busy: false,
+          reason: `stale lease (owner ${owner ? `PID ${owner.ownerPid} dead/reused` : "no owner.json"}, agent chrome PID ${listener} still listening)`,
+          ownerKind: "orphan", stale: true, owner: owner || null,
+        };
       }
       return { busy: true, reason: `durable Agent Chrome (PID ${listener}, no lease)`, ownerKind: "durable" };
     }
@@ -157,17 +188,30 @@ function checkPort(port) {
   const owner0 = readOwner(port);
   if (owner0) {
     if (ownerPidValid(owner0.ownerPid, owner0.ownerStartTime, owner0.kind)) {
-      // owner 活着。检查锁龄：如果在启动宽限期内 → 可能正在起 Chrome → 忙
-      const age = Date.now() - new Date(owner0.createdAt).getTime();
+      // owner 活着。锁龄基准 = max(hbAt, createdAt)：ENSURING 期间 proxy 持续心跳，
+      // 首启整 profile rsync(分钟级)也不会超宽限被误判 zombie；缺 hbAt 回退 createdAt
+      const hbMs = typeof owner0.hbAt === "number" ? owner0.hbAt : 0;
+      const createdMs = new Date(owner0.createdAt).getTime();
+      const age = Date.now() - Math.max(hbMs, Number.isFinite(createdMs) ? createdMs : 0);
       if (age < STARTUP_GRACE_MS) {
         return { busy: true, reason: `lease starting (owner ${owner0.kind} PID ${owner0.ownerPid}, ${Math.round(age / 1000)}s)`, ownerKind: owner0.kind };
       }
       // 超过宽限期但端口无 listener → 可能是 zombie（owner 活但 Chrome 死了）
       // 不直接判定为空闲；返回 zombie 标记，由调用方决定是否回收
-      return { busy: false, reason: `zombie lease (owner ${owner0.kind} PID ${owner0.ownerPid} alive but no listener, ${Math.round(age / 1000)}s old)`, ownerKind: owner0.kind, zombie: true };
+      return { busy: false, reason: `zombie lease (owner ${owner0.kind} PID ${owner0.ownerPid} alive but no listener, ${Math.round(age / 1000)}s since last hb/created)`, ownerKind: owner0.kind, zombie: true, owner: owner0 };
     }
     // owner 已死或 PID 复用 → 孤儿 lease，可回收
-    return { busy: false, reason: `stale lease (owner PID ${owner0.ownerPid} dead/reused)`, ownerKind: "orphan", stale: true };
+    return { busy: false, reason: `stale lease (owner PID ${owner0.ownerPid} dead/reused)`, ownerKind: "orphan", stale: true, owner: owner0 };
+  }
+
+  // 2.5 裸锁（mkdir 后写 owner 前被杀）：宽限期内当忙，超期可回收
+  if (fs.existsSync(lockPath(port))) {
+    let ageMs = 0;
+    try { ageMs = Date.now() - fs.statSync(lockPath(port)).mtimeMs; } catch {}
+    if (ageMs >= STARTUP_GRACE_MS) {
+      return { busy: false, reason: `stale bare lock (no owner.json, ${Math.round(ageMs / 1000)}s old)`, ownerKind: "orphan", stale: true, owner: null };
+    }
+    return { busy: true, reason: `bare lock creating (no owner.json, ${Math.round(ageMs / 1000)}s)`, ownerKind: "creating" };
   }
 
   // 3. 旧锁兼容
@@ -181,8 +225,8 @@ function checkPort(port) {
     if (pidAlive(legacyPid) && pidCommand(legacyPid).includes("cdpcc")) {
       return { busy: true, reason: `legacy cdpcc lock (PID ${legacyPid})`, ownerKind: "legacy-cdpcc" };
     }
-    // 旧 owner 死了 → 可回收
-    return { busy: false, reason: `legacy stale lock (PID ${legacyPid} dead)`, ownerKind: "legacy-orphan", stale: true };
+    // 旧 owner 死了 → 可回收（legacy 锁不在 LOCK_ROOT、无 leaseId 可复核，走 legacy 直删）
+    return { busy: false, reason: `legacy stale lock (PID ${legacyPid} dead)`, ownerKind: "legacy-orphan", stale: true, legacy: true };
   }
 
   return { busy: false, reason: "free", ownerKind: "free" };
@@ -222,8 +266,18 @@ function removeLockIfOwner(port, leaseId) {
   try { fs.rmSync(lockPath(port), { recursive: true }); return true; } catch { return false; }
 }
 
-// 强制删除孤儿锁（owner 已死）
-function forceRemoveOrphanLock(port) {
+// 强制删除孤儿锁：删除前重读 owner.json，仍与判定时的快照(leaseId+ownerPid；
+// null=判定时是裸锁)一致才删——判定与删除之间隔着秒级 kill 等待，不一致说明已有
+// 新 owner 接管，放弃删除让上层换端口/重试，绝不删新锁
+function forceRemoveOrphanLock(port, judgedOwner) {
+  const owner = readOwner(port);
+  if (judgedOwner) {
+    if (!owner) return false;
+    if (String(owner.leaseId) !== String(judgedOwner.leaseId)) return false;
+    if (String(owner.ownerPid) !== String(judgedOwner.ownerPid)) return false;
+  } else if (owner) {
+    return false;
+  }
   try { fs.rmSync(lockPath(port), { recursive: true }); return true; } catch { return false; }
 }
 
@@ -260,9 +314,20 @@ async function killAgentChrome(port) {
 // ---- 核心 API ----
 
 // 领取一个空闲端口租约
-// kind: "zcode-proxy" | "cdpcc"
+// kind: "zcode-cdp-proxy"（owner 必须是常驻进程，pid 会一直活到 lease 结束）
+//   "cdpcc" 已下线：短命 CLI 的 pid 写进 owner.json 后进程即退出，租约出生即
+//   孤儿被抢，直接拒绝返回 null
 // 返回: { port, leaseId } 或 null（端口池满）
 async function reserve(kind = "zcode-proxy", preferredPort = null) {
+  if (kind === "cdpcc") return null;
+  if (preferredPort !== null && preferredPort !== undefined) {
+    if (!Number.isInteger(preferredPort)) {
+      throw new Error(`reserve 端口参数非法(需整数端口号): ${preferredPort}`);
+    }
+    if (!SHARED_PORTS.includes(preferredPort)) {
+      throw new Error(`端口 ${preferredPort} 不在池 ${Math.min(...SHARED_PORTS)}-${Math.max(...SHARED_PORTS)}`);
+    }
+  }
   const pid = process.pid;
   const startTime = pidStartTime(pid);
   const leaseId = randomLeaseId();
@@ -270,21 +335,24 @@ async function reserve(kind = "zcode-proxy", preferredPort = null) {
   const candidates = preferredPort ? [preferredPort] : SHARED_PORTS;
 
   for (const port of candidates) {
-    if (!SHARED_PORTS.includes(port)) continue;
-
     const status = checkPort(port);
     if (status.busy) continue;
 
     // 孤儿/stale/zombie → 先回收再抢
     if (status.stale) {
-      // owner 已死 → 清孤儿 Chrome + 删旧锁
+      // owner 已死 → 清孤儿 Chrome + 删旧锁（删前复核仍是被判定的那把锁；
+      // legacy stale 的锁不在 LOCK_ROOT、无 leaseId 可复核，直接删 v0.1.0 残留）
       await killAgentChrome(port);
-      forceRemoveOrphanLock(port);
-      removeLegacyLock(port);
+      if (status.legacy) {
+        removeLegacyLock(port);
+      } else {
+        if (!forceRemoveOrphanLock(port, status.owner || null)) continue;
+        removeLegacyLock(port);
+      }
     } else if (status.zombie) {
       // owner 活但 Chrome 死了 → 这是 zombie。不能只删锁；
       // 先终止 zombie owner，再清锁。
-      const owner = readOwner(port);
+      const owner = status.owner;
       if (owner && owner.ownerPid && pidAlive(owner.ownerPid)) {
         try { process.kill(owner.ownerPid, "SIGTERM"); } catch {}
         // 等待退出
@@ -296,7 +364,7 @@ async function reserve(kind = "zcode-proxy", preferredPort = null) {
           try { process.kill(owner.ownerPid, "SIGKILL"); } catch {}
         }
       }
-      forceRemoveOrphanLock(port);
+      if (!forceRemoveOrphanLock(port, owner || null)) continue;
     }
 
     // 原子抢锁
@@ -339,6 +407,15 @@ function markActive(port, leaseId, browserPid) {
   return true;
 }
 
+// 心跳：持有者（ENSURING 期间的 proxy）刷新 hbAt，zombie 判定基准取 max(hbAt, createdAt)
+function hb(port, leaseId) {
+  const owner = readOwner(port);
+  if (!owner || owner.leaseId !== leaseId) return false;
+  owner.hbAt = Date.now();
+  writeOwner(port, owner);
+  return true;
+}
+
 // 释放 lease（必须 leaseId 匹配）
 async function release(port, leaseId) {
   const owner = readOwner(port);
@@ -360,18 +437,25 @@ async function reap() {
     const status = checkPort(port);
     if (status.stale) {
       await killAgentChrome(port);
-      forceRemoveOrphanLock(port);
-      removeLegacyLock(port);
-      reaped.push({ port, reason: status.reason });
+      // 删除前复核仍是被判定的那把锁；已被新 owner 接管则本轮跳过；
+      // legacy stale 的锁不在 LOCK_ROOT、无 leaseId 可复核，直接删 v0.1.0 残留
+      if (status.legacy) {
+        removeLegacyLock(port);
+        reaped.push({ port, reason: status.reason });
+      } else if (forceRemoveOrphanLock(port, status.owner || null)) {
+        removeLegacyLock(port);
+        reaped.push({ port, reason: status.reason });
+      }
     } else if (status.zombie) {
-      const owner = readOwner(port);
+      const owner = status.owner;
       if (owner && owner.ownerPid && pidAlive(owner.ownerPid)) {
         try { process.kill(owner.ownerPid, "SIGTERM"); } catch {}
         for (let i = 0; i < 20; i++) { await sleep(200); if (!pidAlive(owner.ownerPid)) break; }
         if (pidAlive(owner.ownerPid)) { try { process.kill(owner.ownerPid, "SIGKILL"); } catch {} }
       }
-      forceRemoveOrphanLock(port);
-      reaped.push({ port, reason: status.reason });
+      if (forceRemoveOrphanLock(port, owner || null)) {
+        reaped.push({ port, reason: status.reason });
+      }
     }
   }
   return reaped;
@@ -406,8 +490,9 @@ if (require.main === module) {
       case "reserve": {
         // kind 需是 owner 进程命令行的子串(ownerPidValid 用它做 marker 校验)
         const kind = process.argv[3] || "zcode-cdp-proxy";
+        if (kind === "cdpcc") { out({ error: "cdpcc 入口已下线,不再发放租约" }); process.exit(1); }
         const portArg = process.argv[4];
-        const preferred = portArg ? parseInt(portArg, 10) : null;
+        const preferred = portArg ? Number(portArg) : null;
         const r = await reserve(kind, preferred);
         if (r) out(r);
         else out({ error: "CDP 端口池已满(7 个会话全在用 9223-9229),关掉一个会话再重试" });
@@ -458,7 +543,7 @@ if (require.main === module) {
 module.exports = {
   SHARED_PORTS, SCRIPT_PORTS, LOCK_ROOT,
   portPid, pidAlive, pidCommand, isAgentChromePid, pidStartTime,
-  checkPort, reserve, release, markActive, reap, statusAll,
+  checkPort, reserve, release, markActive, hb, reap, statusAll,
   killAgentChrome, removeLockIfOwner, readOwner, writeOwner,
   readLegacyLockPid, removeLegacyLock, sleep, log: null,
 };

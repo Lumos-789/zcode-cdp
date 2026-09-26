@@ -37,7 +37,6 @@
   "bin": {
     "zcode-cdp-proxy": "bin/zcode-cdp-proxy.js",
     "zcode-cdp-lease": "bin/zcode-cdp-lease.js",
-    "cdp-takeover": "bin/cdp-takeover",
-    "cdpcc": "bin/cdpcc"
+    "cdp-takeover": "bin/cdp-takeover"
   }
 }

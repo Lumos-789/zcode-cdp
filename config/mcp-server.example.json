@@ -1,6 +1,6 @@
 {
-  "_comment": "Sample MCP server registration for ZCode / Claude Code config.json. Copy this object into the `mcp.servers` map of your client config. Adjust the path to point at your checkout of this repo.",
-  "_comment_2": "ZCode config path: ~/.zcode/cli/config.json   |   Claude Code: ~/.claude.json (or project .mcp.json)",
+  "_comment": "Claude Code：整个文件内容可直接作为项目 .mcp.json；ZCode：取内层 \"cdp\" 对象放进 ~/.zcode/cli/config.json 的 mcp.servers。两种客户端都需先把 args 中的路径指向你本机的 checkout。",
+  "_comment_2": "ZCode config: ~/.zcode/cli/config.json (mcp.servers)   |   Claude Code: <project>/.mcp.json",
   "mcpServers": {
     "cdp": {
       "type": "stdio",

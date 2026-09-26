@@ -2,10 +2,10 @@
 # cdp-takeover — Agent 专用 Chrome 多实例端口池管理器
 #
 # 两类 Agent Chrome（各占独立端口 + profile，两层隔离：端口 / profile）：
-#   - 会话临时池：9223-9229（ZCode/Codex/cdpcc 临时浏览器，最多 7 个并发）
+#   - 会话临时池：9223-9229（ZCode/Codex 临时浏览器，最多 7 个并发）
 #   - 脚本固定端口：93xx（durable 浏览器，供 Python/playwright 直连客户端长期常驻，不进 pick 池）
 #
-# cdpcc 自动从 9223-9229 找第一个空闲端口；自动化脚本显式指定 93xx 端口。
+# 会话端自动从临时池 pick 第一个空闲端口；自动化脚本显式指定 93xx 端口。
 # 工具前缀统一 mcp__cdp__*（按需改造后不再按端口区分 cdp/cdp2/cdp3）。
 # profile 首次从用户 profile rsync 继承登录态，之后独立演化；--refresh 手动刷新。
 # profile 头像（每端口不同卡通 avatar），区分各实例。
@@ -13,61 +13,67 @@
 # 两种启动模式：
 #   - durable（默认）：人工直接调用，Chrome 跨客户端连接长期存在，不创建会话 lease。
 #     用于直接 CDP 客户端（Python 裸 WebSocket / playwright connect_over_cdp）。
-#   - managed（--managed --lease-id <id>）：由 zcode-cdp-proxy/cdpcc 调用，
-#     核验调用者拥有端口 lease 后启动 Chrome。proxy/cdpcc 退出时通过 lease 释放。
+#   - managed（--managed --lease-id <id>）：由 zcode-cdp-proxy 调用，
+#     核验调用者拥有端口 lease 后启动 Chrome。proxy 退出时通过 lease 释放。
 #     参数组必须完整：--managed 与 --lease-id、显式端口三缺一即 stderr 报错 exit 1
 #     （fail-loud），绝不静默跳过 lease 核验按 durable 降级启动。
 #
 # 用法：
 #   cdp-takeover                    自动找第一个空闲端口（durable）
 #   cdp-takeover <port>             显式端口（9223-9229 / 93xx）（durable）
-#   cdp-takeover <port> --refresh   强制从源 rsync 该端口 profile（实例须已关）
+#   cdp-takeover <port> --refresh   强制从源 rsync 该端口 profile（实例须已关；在跑即报错）
 #   cdp-takeover --refresh <port>   同上
-#   cdp-takeover <port> --managed --lease-id <id>   managed 模式（proxy/cdpcc 内部用；
+#   cdp-takeover <port> --managed --lease-id <id>   managed 模式（proxy 内部用；
 #                                                   三参数缺一即报错退出，不降级 durable）
 #   cdp-takeover status             打印端口占用表
 
 set -euo pipefail
 
-# 会话临时池（ZCode/Codex/cdpcc 从中 pick 空闲）
-PORTS=(9223 9224 9225 9226 9227 9228 9229)
+# 仅支持 macOS：profile 源路径 / Chrome 二进制 / BSD stat(1) 都是 macOS 事实，不做 Linux 适配
+if [ "$(uname)" != "Darwin" ]; then
+  echo "❌ cdp-takeover 仅支持 macOS（依赖 macOS 的 Chrome 路径与系统工具）" >&2
+  exit 1
+fi
+
+# 会话临时池（ZCode/Codex 从中 pick 空闲）；CDP_PORTS 可覆盖，空白分隔，解析口径与 zcode-cdp-lease 一致
+read -r -a PORTS <<< "${CDP_PORTS:-9223 9224 9225 9226 9227 9228 9229}"
 # status 展示用（含脚本固定端口示例，用户可按需修改）
 SCRIPT_PORTS=(9324 9325 9326)
-ALL_PORTS=(9223 9224 9225 9226 9227 9228 9229 9324 9325 9326)
+ALL_PORTS=("${PORTS[@]}" "${SCRIPT_PORTS[@]}")
 # 93xx 端口用途示例（用户按需自定）：9324 / 9326 可作为 durable 客户端固定端口
 PROFILE_SRC="$HOME/Library/Application Support/Google/Chrome"
 LOCKDIR="/tmp/cdp-takeover.$USER.lock"
 
+# 结算日志:proxy 驱动的启动其输出已由 proxy tee 落同一文件;
+# 人工/脚本直跑的在此补一行结果,排查启动故障用。任何失败都不影响脚本退出码。
+TKLOG_DIR="$HOME/.zcode/v2/logs"
+flog() { { mkdir -p "$TKLOG_DIR" 2>/dev/null; echo "[cdp-takeover $$ $(date '+%F %T')] $*" >> "$TKLOG_DIR/cdp-proxy-$(date +%F).log"; } 2>/dev/null || true; }
+
 # 端口 → 配置：owner|avatar_idx|window_pos
 # owner：session(会话临时池) / scripts(脚本固定端口)；avatar_idx：Chrome 内置头像编号
+# 93xx 脚本固定端口不在临时池、无池内索引，保留静态表；会话池端口（CDP_PORTS，
+# 默认 9223-9229）按池内索引动态生成——avatar 按序取值、窗口位置按级联错开，
+# 池超 7 槽回绕；自定义池端口不再因静态表缺失被拒（对默认池生成值与原静态表一致）
+SESSION_AVATARS=(8 16 24 32 40 48 52)
 port_meta() {
   case "$1" in
-    9223) echo "session|8|60,60" ;;
-    9224) echo "session|16|60,210" ;;
-    9225) echo "session|24|60,360" ;;
-    9226) echo "session|32|60,510" ;;
-    9227) echo "session|40|60,660" ;;
-    9228) echo "session|48|60,810" ;;
-    9229) echo "session|52|60,960" ;;
-    9324) echo "scripts|58|360,60" ;;
-    9325) echo "scripts|59|360,210" ;;
-    9326) echo "scripts|60|360,360" ;;
-    *) return 1 ;;
+    9324) echo "scripts|58|360,60" ; return 0 ;;
+    9325) echo "scripts|59|360,210"; return 0 ;;
+    9326) echo "scripts|60|360,360"; return 0 ;;
   esac
+  local i idx
+  for i in $(seq 0 $((${#PORTS[@]} - 1))); do
+    if [ "${PORTS[$i]}" = "$1" ]; then
+      idx=$((i % ${#SESSION_AVATARS[@]}))
+      echo "session|${SESSION_AVATARS[$idx]}|60,$((60 + 150 * idx))"
+      return 0
+    fi
+  done
+  return 1
 }
 
 port_pid() { lsof -iTCP:"$1" -sTCP:LISTEN -P -n -t 2>/dev/null | head -1 || true; }
 is_agent_pid() { [ -n "${1:-}" ] && ps -p "$1" -o args= 2>/dev/null | grep -q "chrome-takeover"; }
-
-# cdpcc 窗口锁主是否存活(status 只读判定,与 cdpcc 脚本同款:PID 存活 + command 含 cdpcc)
-cdpcc_lock_alive() {
-  local pid cmd
-  pid=$(cat "/tmp/cdpcc-port-$1.lock/pid" 2>/dev/null) || return 1
-  [ -n "$pid" ] || return 1
-  kill -0 "$pid" 2>/dev/null || return 1
-  cmd=$(ps -p "$pid" -o command= 2>/dev/null) || return 1
-  case "$cmd" in *cdpcc*) return 0 ;; *) return 1 ;; esac
-}
 
 # 全局锁:带 owner PID 的原子锁,防 SIGKILL 遗留空目录永久阻塞
 # 锁格式: $LOCKDIR/owner (内容: PID|startTime)
@@ -79,7 +85,8 @@ acquire_lock() {
   for attempt in 1 2 3 4 5; do
     if mkdir "$LOCKDIR" 2>/dev/null; then
       echo "${owner_pid}|${owner_start}" > "$LOCKDIR/owner"
-      trap 'rmdir "$LOCKDIR" 2>/dev/null || true' EXIT INT TERM
+      # 先删 owner 文件再 rmdir：锁目录非空时 rmdir 必失败，会把锁漏给下次运行误判 owner 已死
+      trap 'rm -f "$LOCKDIR/owner" 2>/dev/null; rmdir "$LOCKDIR" 2>/dev/null || true' EXIT INT TERM
       return 0
     fi
     # 锁已存在:校验 owner 是否存活
@@ -105,6 +112,7 @@ acquire_lock() {
     sleep 1
   done
   echo "⏳ 另一个 cdp-takeover 正在分配端口，5s 后仍忙" >&2
+  flog "exit=1 全局锁 5s 仍忙"
   exit 1
 }
 
@@ -133,7 +141,9 @@ do_status() {
   local lease_root="${CDP_LOCK_ROOT:-/tmp/zcode-cdp/ports}"
   for p in "${ALL_PORTS[@]}"; do
     local pid owner note lease_pid lease_state
-    pid=$(port_pid "$p"); owner=$(port_meta "$p"); owner="${owner%%|*}"
+    pid=$(port_pid "$p"); owner=$(port_meta "$p" || true); owner="${owner%%|*}"
+    # CDP_PORTS 可含表外端口：port_meta 查不到不致命，owner 显示为 -
+    [ -n "$owner" ] || owner="-"
     # 每轮重置:lease_* 只在有锁时赋值,残留上轮的值会把无锁端口误显示成"占位"
     lease_pid=""; lease_state=""
     if [ "${owner}" = "session" ]; then note="会话临时池"; elif [ "${owner}" = "scripts" ]; then note="脚本固定端口"; else note="-"; fi
@@ -150,8 +160,6 @@ do_status() {
       fi
     elif [ -n "${lease_pid:-}" ]; then
       printf "%-7s %-6s %-8s %-7s %s\n" "$p" "占位" "${lease_pid}" "${owner}" "${note},lease=${lease_state:-?}"
-    elif [ "${owner}" = "session" ] && cdpcc_lock_alive "$p"; then
-      printf "%-7s %-6s %-8s %-7s %s\n" "$p" "占位" "-" "${owner}" "${note},浏览器未起(旧锁)"
     else
       printf "%-7s %-6s %-8s %-7s %s\n" "$p" "空闲" "-" "${owner}" "${note}"
     fi
@@ -181,7 +189,7 @@ while [ $# -gt 0 ]; do
   shift
 done
 
-# managed 模式:核验调用者拥有端口 lease（proxy/cdpcc 内部调用专用）
+# managed 模式:核验调用者拥有端口 lease（proxy 内部调用专用）
 # fail-loud：--managed 必须与 --lease-id、显式端口成对传入；此前条件不满足会静默
 # 跳过 lease 核验、按 durable 启动（安全面静默降级），现改为缺任一即报错 exit 1。
 # 校验放在 acquire_lock 之前：注定失败的参数组不占全局锁。
@@ -203,25 +211,33 @@ acquire_lock
 # 确定目标端口
 if [ -z "${TARGET_PORT}" ]; then
   if ! TARGET_PORT=$(pick_free_port); then
-    echo "❌ 七个临时端口（9223-9229）都在用，开不了第 8 个实例。" >&2
+    echo "❌ 临时端口池（${PORTS[*]}）都在用，开不了新实例。" >&2
+    flog "exit=1 临时端口池（${PORTS[*]}）都在用"
     echo "" >&2; do_status >&2; echo "" >&2
-    echo "提示：先 Cmd+Q 关掉一个 cdpcc 窗口释放端口再重试。" >&2
+    echo "提示：先 Cmd+Q 关掉一个占用临时端口的会话/浏览器窗口释放端口再重试。" >&2
     exit 1
   fi
 fi
 
-meta=$(port_meta "${TARGET_PORT}") || { echo "❌ 端口 ${TARGET_PORT} 不在支持范围（临时 9223-9229 / 脚本 93xx）" >&2; exit 1; }
+meta=$(port_meta "${TARGET_PORT}") || { echo "❌ 端口 ${TARGET_PORT} 不在支持范围（临时池 ${PORTS[*]} / 脚本 93xx）" >&2; exit 1; }
 IFS='|' read -r OWNER AVATAR_IDX WIN_POS <<< "$meta"
 PROFILE_DST="$HOME/.chrome-takeover-${TARGET_PORT}"
 
-# 防重入（实例在跑 → 复用；非 agent 占用 → 报错）
+# 防重入（实例在跑 → 复用；非 agent 占用 → 报错；--refresh 有实例在跑 → 报错，不静默跳过刷新）
 pid=$(port_pid "${TARGET_PORT}")
 if [ -n "${pid}" ]; then
+  if [ "$REFRESH" = "1" ]; then
+    echo "❌ --refresh 前置条件不满足：端口 ${TARGET_PORT} 有实例在跑（PID ${pid}），先关闭该实例再刷新" >&2
+    exit 1
+  fi
   if is_agent_pid "${pid}"; then
     echo "✅ Agent Chrome 已在跑 — 端口 ${TARGET_PORT}（PID ${pid}，${OWNER}）"
+    flog "port=${TARGET_PORT} reuse 已在跑 pid=${pid}"
     exit 0
   else
-    echo "❌ 端口 ${TARGET_PORT} 被非 agent 进程占用（PID ${pid}）" >&2; exit 1
+    echo "❌ 端口 ${TARGET_PORT} 被非 agent 进程占用（PID ${pid}）" >&2
+    flog "exit=1 port=${TARGET_PORT} 被非 agent 占用 pid=${pid}"
+    exit 1
   fi
 fi
 
@@ -314,6 +330,7 @@ for i in $(seq 1 15); do
 done
 if [ "$ready" != "1" ]; then
   echo "❌ 端口 ${TARGET_PORT} 15s 后仍未监听，启动失败" >&2
+  flog "exit=1 port=${TARGET_PORT} 15s 未监听,启动失败"
   exit 1
 fi
 
@@ -333,4 +350,5 @@ else
   echo "⚠️ 端口 ${TARGET_PORT} 就绪但 10s 未见 page 目标，放行（上层将自建标签）" >&2
   echo "✅ Agent Chrome 就绪 — 端口 ${TARGET_PORT}（${OWNER}）"
 fi
+flog "port=${TARGET_PORT} ready page_seen=${page_seen} mode=$( [ "$MANAGED" = "1" ] && echo managed || echo durable )"
 exit 0
