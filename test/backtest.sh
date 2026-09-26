@@ -7,7 +7,7 @@
 #   L2 proxy 状态机 stub 化 backend+takeover,端到端 激活→close→rearm→再激活
 #
 # 全程零真实 Chrome、零用户 profile 副作用、不碰生产 9223-9229 端口。
-# 改代码后跑 `npm test`;真机 live 冒烟(真 Chrome)手动步骤见 docs/backtest.md。
+# 改代码后跑 `npm test`。
 
 set -uo pipefail
 cd "$(dirname "$0")/.."

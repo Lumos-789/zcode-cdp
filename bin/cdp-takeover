@@ -42,16 +42,16 @@ LOCKDIR="/tmp/cdp-takeover.$USER.lock"
 # owner：session(会话临时池) / scripts(脚本固定端口)；avatar_idx：Chrome 内置头像编号
 port_meta() {
   case "$1" in
-    9223) echo "session|8|-1655,-1340" ;;
-    9224) echo "session|16|-1655,-1190" ;;
-    9225) echo "session|24|-1655,-1040" ;;
-    9226) echo "session|32|-1655,-890" ;;
-    9227) echo "session|40|-1655,-740" ;;
-    9228) echo "session|48|-1655,-590" ;;
-    9229) echo "session|52|-1655,-440" ;;
-    9324) echo "scripts|58|-1350,-1190" ;;
-    9325) echo "scripts|59|-1350,-1040" ;;  # MjAI 周榜守护 durable（week_guard.py 专用）
-    9326) echo "scripts|60|-1350,-890" ;;
+    9223) echo "session|8|60,60" ;;
+    9224) echo "session|16|60,210" ;;
+    9225) echo "session|24|60,360" ;;
+    9226) echo "session|32|60,510" ;;
+    9227) echo "session|40|60,660" ;;
+    9228) echo "session|48|60,810" ;;
+    9229) echo "session|52|60,960" ;;
+    9324) echo "scripts|58|360,60" ;;
+    9325) echo "scripts|59|360,210" ;;
+    9326) echo "scripts|60|360,360" ;;
     *) return 1 ;;
   esac
 }
@@ -294,8 +294,8 @@ if os.path.exists(local_state_path):
     print(f"✅ Local State: avatar={os.environ['AVATAR_IDX']}")
 PYEOF
 
-# 启动 Agent Chrome（外接左屏，多窗口 Y 错开层叠）
-echo "启动 Agent Chrome（外接左屏），端口 ${TARGET_PORT}..."
+# 启动接管 Chrome（多窗口错开层叠）
+echo "启动接管 Chrome，端口 ${TARGET_PORT}..."
 nohup /Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome \
   --remote-debugging-port="${TARGET_PORT}" \
   --remote-allow-origins=* \

@@ -13,8 +13,7 @@
 //     (reserve → cdp-takeover → 接通中继);browser_close 响应后 → teardown
 //     (断中继、杀 Chrome、释放租约)。所有消息始终透传。
 //   - 状态机:IDLE → ENSURING → ACTIVE → IDLE(+SHUTTING_DOWN/EXITED)。
-//   - 依据:playwright-mcp 单实例在 browser_close 后可完全复用(实验证实,
-//     见 docs/architecture.md),Chrome 起停/端口轮换对 backend 只是断线重连。
+//   - 依据:playwright-mcp 单实例在 browser_close 后可完全复用(实验证实),Chrome 起停/端口轮换对 backend 只是断线重连。
 //
 // 防护设计(勿删):
 //   - 三层看门狗:软(事件循环 lag)/孤儿(业务心跳超时)/硬(worker 线程 SIGKILL)
